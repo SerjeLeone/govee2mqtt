@@ -1,6 +1,6 @@
 use crate::ble::TargetHumidity;
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
-use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
+use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::hass_mqtt::work_mode::ParsedWorkMode;
 use crate::platform_api::{DeviceParameters, DeviceType, IntegerRange};
 use crate::service::device::Device as ServiceDevice;
@@ -170,11 +170,11 @@ impl EntityInstance for Humidifier {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "humidifier entity").await
+        else {
+            return Ok(());
+        };
 
         match device.device_state() {
             Some(device_state) => {

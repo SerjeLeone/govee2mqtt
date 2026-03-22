@@ -1,4 +1,5 @@
 use crate::hass_mqtt::base::EntityConfig;
+use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::HassClient;
 use crate::service::state::StateHandle;
 use anyhow::Context;
@@ -27,7 +28,19 @@ pub async fn publish_entity_config<T: Serialize>(
         unique_id = base.unique_id
     );
 
-    client.publish_obj(topic, config).await
+    client.publish_obj_retained(topic, config).await
+}
+
+pub async fn lookup_entity_device(
+    state: &StateHandle,
+    device_id: &str,
+    entity: &str,
+) -> Option<ServiceDevice> {
+    let device = state.device_by_id(device_id).await;
+    if device.is_none() {
+        log::warn!("Skipping {entity} notify_state for missing device {device_id}");
+    }
+    device
 }
 
 #[derive(Default, Clone)]
@@ -71,5 +84,39 @@ impl EntityList {
                 .context("EntityList::notify_state")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntityList;
+    use crate::hass_mqtt::number::MusicSensitivityNumber;
+    use crate::hass_mqtt::sensor::GlobalFixedDiagnostic;
+    use crate::service::device::Device;
+    use crate::service::hass::HassClient;
+    use crate::service::state::State;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn entity_list_skips_missing_devices_and_continues_notifying() {
+        let state = Arc::new(State::new());
+        let missing_device = Device::new("H6000", "AA:BB");
+        let missing_entity = MusicSensitivityNumber::new(&missing_device, &state);
+        let healthy_entity = GlobalFixedDiagnostic::new("Version", "1.2.3");
+        let client = HassClient::new_test();
+
+        let mut entities = EntityList::new();
+        entities.add(missing_entity);
+        entities.add(healthy_entity);
+
+        entities.notify_state(&client).await.unwrap();
+
+        assert_eq!(
+            client.published_messages(),
+            vec![(
+                "gv2mqtt/sensor/global-version/state".to_string(),
+                "1.2.3".to_string()
+            )]
+        );
     }
 }

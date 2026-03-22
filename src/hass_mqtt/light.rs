@@ -1,5 +1,5 @@
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
-use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
+use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceType;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
@@ -9,7 +9,7 @@ use crate::service::hass::{
 use crate::service::state::StateHandle;
 use async_trait::async_trait;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 /// <https://www.home-assistant.io/integrations/light.mqtt/#json-schema>
 #[derive(Serialize, Clone, Debug)]
@@ -25,6 +25,7 @@ pub struct LightConfig {
     pub optimistic: bool,
     pub supported_color_modes: Vec<String>,
     /// Flag that defines if the light supports brightness.
+    #[serde(skip_serializing)]
     pub brightness: bool,
     /// Defines the maximum brightness value (i.e., 100%) of the MQTT device.
     pub brightness_scale: u32,
@@ -70,11 +71,10 @@ impl EntityInstance for DeviceLight {
             return Ok(());
         }
 
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) = lookup_entity_device(&self.state, &self.device_id, "light entity").await
+        else {
+            return Ok(());
+        };
 
         match device.device_state() {
             Some(device_state) => {
@@ -83,27 +83,49 @@ impl EntityInstance for DeviceLight {
                 let is_on = device_state.light_on.unwrap_or(false);
 
                 let light_state = if is_on {
-                    if device_state.kelvin == 0 {
-                        json!({
-                            "state": "ON",
-                            "color_mode": "rgb",
-                            "color": {
+                    let mut payload = Map::new();
+                    payload.insert("state".to_string(), json!("ON"));
+
+                    let color_mode = if self.supports_color_mode("rgb") && device_state.kelvin == 0
+                    {
+                        payload.insert(
+                            "color".to_string(),
+                            json!({
                                 "r": device_state.color.r,
                                 "g": device_state.color.g,
                                 "b": device_state.color.b,
-                            },
-                            "brightness": device_state.brightness,
-                            "effect": device_state.scene,
-                        })
+                            }),
+                        );
+                        Some("rgb")
+                    } else if self.supports_color_mode("color_temp") && device_state.kelvin != 0 {
+                        payload.insert(
+                            "color_temp".to_string(),
+                            json!(kelvin_to_mired(device_state.kelvin)),
+                        );
+                        Some("color_temp")
+                    } else if self.supports_color_mode("brightness") {
+                        Some("brightness")
+                    } else if self.supports_color_mode("onoff") {
+                        Some("onoff")
                     } else {
-                        json!({
-                            "state": "ON",
-                            "color_mode": "color_temp",
-                            "brightness": device_state.brightness,
-                            "color_temp": kelvin_to_mired(device_state.kelvin),
-                            "effect": device_state.scene,
-                        })
+                        None
+                    };
+
+                    if let Some(color_mode) = color_mode {
+                        payload.insert("color_mode".to_string(), json!(color_mode));
                     }
+
+                    if self.light.brightness
+                        && matches!(color_mode, Some("rgb" | "color_temp" | "brightness"))
+                    {
+                        payload.insert("brightness".to_string(), json!(device_state.brightness));
+                    }
+
+                    if let Some(scene) = &device_state.scene {
+                        payload.insert("effect".to_string(), json!(scene));
+                    }
+
+                    Value::Object(payload)
                 } else {
                     json!({"state":"OFF"})
                 };
@@ -125,6 +147,13 @@ impl EntityInstance for DeviceLight {
 }
 
 impl DeviceLight {
+    fn supports_color_mode(&self, mode: &str) -> bool {
+        self.light
+            .supported_color_modes
+            .iter()
+            .any(|supported| supported == mode)
+    }
+
     pub async fn for_device(
         device: &ServiceDevice,
         state: &StateHandle,
@@ -187,16 +216,14 @@ impl DeviceLight {
             (None, None)
         };
 
-        let brightness = segment.is_some()
-            || quirk
-                .as_ref()
-                .map(|q| q.supports_brightness)
-                .unwrap_or(false)
-            || device
-                .http_device_info
-                .as_ref()
-                .map(|info| info.supports_brightness())
-                .unwrap_or(false);
+        let brightness = segment.is_some() || device.supports_brightness();
+
+        if brightness && supported_color_modes.is_empty() {
+            supported_color_modes.push("brightness".to_string());
+        }
+        if supported_color_modes.is_empty() {
+            supported_color_modes.push("onoff".to_string());
+        }
 
         let name = match segment {
             Some(n) => Some(format!("Segment {:03}", n + 1)),
@@ -233,5 +260,174 @@ impl DeviceLight {
             device_id: device.id.to_string(),
             state: state.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceLight;
+    use crate::hass_mqtt::instance::EntityInstance;
+    use crate::lan_api::{DeviceColor, DeviceStatus, LanDevice};
+    use crate::platform_api::{
+        DeviceCapability, DeviceCapabilityKind, DeviceParameters, DeviceType, HttpDeviceInfo,
+        IntegerRange,
+    };
+    use crate::service::device::Device;
+    use crate::service::hass::HassClient;
+    use crate::service::state::State;
+    use std::sync::Arc;
+
+    fn http_device_info(capabilities: Vec<DeviceCapability>) -> HttpDeviceInfo {
+        HttpDeviceInfo {
+            sku: "H6000".to_string(),
+            device: "AA:BB".to_string(),
+            device_name: "Desk Lamp".to_string(),
+            device_type: DeviceType::Light,
+            capabilities,
+        }
+    }
+
+    #[tokio::test]
+    async fn device_light_publishes_config_and_state_without_broker() {
+        let state = Arc::new(State::new());
+        state
+            .set_hass_disco_prefix("homeassistant".to_string())
+            .await;
+
+        let device_id = "AA:BB";
+        {
+            let mut device = state.device_mut("H6000", device_id).await;
+            device.set_lan_device(LanDevice {
+                ip: "127.0.0.1".parse().unwrap(),
+                device: device_id.to_string(),
+                sku: "H6000".to_string(),
+                ble_version_hard: "1.00.00".to_string(),
+                ble_version_soft: "1.00.00".to_string(),
+                wifi_version_hard: "1.00.00".to_string(),
+                wifi_version_soft: "1.00.00".to_string(),
+            });
+            device.set_lan_device_status(DeviceStatus {
+                on: true,
+                brightness: 64,
+                color: DeviceColor { r: 1, g: 2, b: 3 },
+                color_temperature_kelvin: 0,
+            });
+            device.set_active_scene(Some("Sunrise"));
+        }
+
+        let device = state.device_by_id(device_id).await.unwrap();
+        let light = DeviceLight::for_device(&device, &state, None)
+            .await
+            .unwrap();
+        let client = HassClient::new_test();
+
+        light.publish_config(&state, &client).await.unwrap();
+        light.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert_eq!(published.len(), 2);
+        assert_eq!(
+            published[0].0,
+            "homeassistant/light/gv2mqtt-AABB/config".to_string()
+        );
+        assert!(published[0]
+            .1
+            .contains("\"command_topic\":\"gv2mqtt/light/AABB/command\""));
+        assert!(published[0]
+            .1
+            .contains("\"state_topic\":\"gv2mqtt/light/AABB/state\""));
+        assert_eq!(published[1].0, "gv2mqtt/light/AABB/state".to_string());
+        assert!(published[1].1.contains("\"state\":\"ON\""));
+        assert!(published[1].1.contains("\"brightness\":64"));
+        assert!(published[1].1.contains("\"effect\":\"Sunrise\""));
+    }
+
+    #[tokio::test]
+    async fn device_light_falls_back_to_brightness_mode_without_deprecated_flag() {
+        let state = Arc::new(State::new());
+        state
+            .set_hass_disco_prefix("homeassistant".to_string())
+            .await;
+
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_http_device_info(http_device_info(vec![DeviceCapability {
+                kind: DeviceCapabilityKind::Range,
+                instance: "brightness".to_string(),
+                parameters: Some(DeviceParameters::Integer {
+                    unit: Some("unit.percent".to_string()),
+                    range: IntegerRange {
+                        min: 0,
+                        max: 100,
+                        precision: 1,
+                    },
+                }),
+                alarm_type: None,
+                event_state: None,
+            }]));
+            device.set_lan_device_status(DeviceStatus {
+                on: true,
+                brightness: 42,
+                color: DeviceColor { r: 4, g: 5, b: 6 },
+                color_temperature_kelvin: 0,
+            });
+        }
+
+        let device = state.device_by_id("AA:BB").await.unwrap();
+        let light = DeviceLight::for_device(&device, &state, None)
+            .await
+            .unwrap();
+        let client = HassClient::new_test();
+
+        light.publish_config(&state, &client).await.unwrap();
+        light.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert!(published[0]
+            .1
+            .contains("\"supported_color_modes\":[\"brightness\"]"));
+        assert!(!published[0].1.contains("\"brightness\":"));
+        assert!(published[1].1.contains("\"color_mode\":\"brightness\""));
+        assert!(published[1].1.contains("\"brightness\":42"));
+    }
+
+    #[tokio::test]
+    async fn device_light_falls_back_to_onoff_mode() {
+        let state = Arc::new(State::new());
+        {
+            let mut device = state.device_mut("H6000", "AA:CC").await;
+            device.set_lan_device_status(DeviceStatus {
+                on: true,
+                brightness: 12,
+                color: DeviceColor { r: 7, g: 8, b: 9 },
+                color_temperature_kelvin: 0,
+            });
+        }
+
+        let device = state.device_by_id("AA:CC").await.unwrap();
+        let light = DeviceLight::for_device(&device, &state, None)
+            .await
+            .unwrap();
+        let client = HassClient::new_test();
+
+        light.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert_eq!(light.light.supported_color_modes, vec!["onoff".to_string()]);
+        assert!(published[0].1.contains("\"color_mode\":\"onoff\""));
+        assert!(!published[0].1.contains("\"brightness\":"));
+    }
+
+    #[tokio::test]
+    async fn device_light_notify_state_is_noop_when_device_is_missing() {
+        let state = Arc::new(State::new());
+        let light = DeviceLight::for_device(&Device::new("H6000", "AA:DD"), &state, None)
+            .await
+            .unwrap();
+        let client = HassClient::new_test();
+
+        light.notify_state(&client).await.unwrap();
+
+        assert!(client.published_messages().is_empty());
     }
 }

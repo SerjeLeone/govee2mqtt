@@ -1,13 +1,15 @@
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
-use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
+use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceCapability;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
     availability_topic, camel_case_to_space_separated, switch_instance_state_topic, topic_safe_id,
-    HassClient,
+    HassClient, IdParameter,
 };
 use crate::service::state::StateHandle;
+use anyhow::Context;
 use async_trait::async_trait;
+use mosquitto_rs::router::{Params, Payload, State};
 use serde::Serialize;
 use serde_json::json;
 
@@ -17,6 +19,8 @@ pub struct SwitchConfig {
     pub base: EntityConfig,
     pub command_topic: String,
     pub state_topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_by_default: Option<bool>,
 }
 
 impl SwitchConfig {
@@ -50,6 +54,7 @@ impl SwitchConfig {
             },
             command_topic,
             state_topic,
+            enabled_by_default: None,
         })
     }
 
@@ -88,11 +93,11 @@ impl EntityInstance for CapabilitySwitch {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "capability switch").await
+        else {
+            return Ok(());
+        };
 
         if self.instance_name == "powerSwitch" {
             if let Some(state) = device.device_state() {
@@ -140,5 +145,124 @@ impl EntityInstance for CapabilitySwitch {
             instance = self.instance_name
         );
         Ok(())
+    }
+}
+
+pub struct MusicAutoColorSwitch {
+    switch: SwitchConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl MusicAutoColorSwitch {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!("gv2mqtt-{id}-music-auto-color", id = topic_safe_id(device));
+
+        Self {
+            switch: SwitchConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("Music Auto Color".to_string()),
+                    device_class: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id,
+                    entity_category: None,
+                    icon: None,
+                },
+                command_topic: format!(
+                    "gv2mqtt/{id}/set-music-auto-color",
+                    id = topic_safe_id(device)
+                ),
+                state_topic: format!(
+                    "gv2mqtt/switch/{id}/music-auto-color/state",
+                    id = topic_safe_id(device)
+                ),
+                enabled_by_default: Some(false),
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for MusicAutoColorSwitch {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.switch.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "music auto color switch").await
+        else {
+            return Ok(());
+        };
+
+        let enabled = if let Some(cap) = device.get_state_capability_by_instance("musicMode") {
+            cap.state
+                .pointer("/value/autoColor")
+                .and_then(|value| value.as_i64())
+                .map(|value| value != 0)
+        } else {
+            device.active_music_mode().map(|music| music.auto_color)
+        };
+
+        if let Some(enabled) = enabled {
+            client
+                .publish(&self.switch.state_topic, if enabled { "ON" } else { "OFF" })
+                .await?;
+        }
+
+        Ok(())
+    }
+}
+
+pub async fn mqtt_set_music_auto_color(
+    Payload(command): Payload<String>,
+    Params(IdParameter { id }): Params<IdParameter>,
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    let device = state.resolve_device_for_control(&id).await?;
+    let auto_color = match command.as_str() {
+        "ON" | "on" => true,
+        "OFF" | "off" => false,
+        _ => anyhow::bail!("invalid music auto color state {command}"),
+    };
+
+    state
+        .device_set_music_auto_color(&device, auto_color)
+        .await
+        .context("mqtt_set_music_auto_color: state.device_set_music_auto_color")?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MusicAutoColorSwitch;
+    use crate::hass_mqtt::instance::EntityInstance;
+    use crate::service::device::Device;
+    use crate::service::state::State;
+    use std::sync::Arc;
+
+    #[test]
+    fn music_auto_color_switch_has_expected_topics_and_registry_defaults() {
+        let device = Device::new("H6000", "AA:BB");
+        let state = Arc::new(State::new());
+        let entity = MusicAutoColorSwitch::new(&device, &state);
+
+        assert_eq!(entity.switch.base.name.as_deref(), Some("Music Auto Color"));
+        assert_eq!(
+            entity.switch.command_topic,
+            "gv2mqtt/AABB/set-music-auto-color"
+        );
+        assert_eq!(
+            entity.switch.state_topic,
+            "gv2mqtt/switch/AABB/music-auto-color/state"
+        );
+        assert_eq!(entity.switch.enabled_by_default, Some(false));
+
+        let _entity_trait: &dyn EntityInstance = &entity;
     }
 }

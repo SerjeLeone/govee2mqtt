@@ -1,5 +1,5 @@
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
-use crate::hass_mqtt::instance::EntityInstance;
+use crate::hass_mqtt::instance::{lookup_entity_device, EntityInstance};
 use crate::hass_mqtt::number::NumberConfig;
 use crate::platform_api::{DeviceCapability, DeviceParameters};
 use crate::service::device::Device as ServiceDevice;
@@ -118,6 +118,7 @@ impl TargetTemperatureEntity {
                 max: Some(constraints.max.value().ceil() as f32),
                 step: 1.0,
                 unit_of_measurement: Some(units.unit_of_measurement()),
+                enabled_by_default: None,
             },
             device_id: device.id.to_string(),
             state: state.clone(),
@@ -133,11 +134,11 @@ impl EntityInstance for TargetTemperatureEntity {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "target temperature entity").await
+        else {
+            return Ok(());
+        };
 
         let quirk = device.resolve_quirk();
 
@@ -209,4 +210,61 @@ pub async fn mqtt_set_temperature(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetTemperatureEntity;
+    use crate::platform_api::{
+        DeviceCapability, DeviceCapabilityKind, DeviceParameters, IntegerRange, StructField,
+    };
+    use crate::service::device::Device;
+    use crate::service::state::State;
+    use crate::temperature::TemperatureScale;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn target_temperature_entity_keeps_enabled_by_default_unset() {
+        let device = Device::new("H7160", "AA:BB");
+        let state = Arc::new(State::new());
+        state.set_temperature_scale(TemperatureScale::Celsius).await;
+
+        let capability = DeviceCapability {
+            kind: DeviceCapabilityKind::TemperatureSetting,
+            instance: "targetTemperature".to_string(),
+            parameters: Some(DeviceParameters::Struct {
+                fields: vec![
+                    StructField {
+                        field_name: "unit".to_string(),
+                        field_type: DeviceParameters::Enum { options: vec![] },
+                        default_value: Some(json!("C")),
+                        required: true,
+                    },
+                    StructField {
+                        field_name: "temperature".to_string(),
+                        field_type: DeviceParameters::Integer {
+                            unit: Some("C".to_string()),
+                            range: IntegerRange {
+                                min: 20,
+                                max: 90,
+                                precision: 1,
+                            },
+                        },
+                        default_value: None,
+                        required: true,
+                    },
+                ],
+            }),
+            alarm_type: None,
+            event_state: None,
+        };
+
+        let entity = TargetTemperatureEntity::new(&device, &state, &capability)
+            .await
+            .unwrap();
+
+        assert_eq!(entity.number.enabled_by_default, None);
+        assert_eq!(entity.number.unit_of_measurement, Some("°C"));
+    }
 }

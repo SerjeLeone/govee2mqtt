@@ -1,0 +1,20 @@
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+COPY docker-target/linux/arm64/govee /app/govee
+COPY AmazonRootCA1.pem /app/
+COPY assets /app/assets
+
+ENV \
+  RUST_BACKTRACE=full \
+  PATH=/app:$PATH \
+  XDG_CACHE_HOME=/data
+
+VOLUME /data
+
+CMD ["/app/govee", \
+  "serve", \
+  "--govee-iot-key=/data/iot.key", \
+  "--govee-iot-cert=/data/iot.cert", \
+  "--amazon-root-ca=/app/AmazonRootCA1.pem"]

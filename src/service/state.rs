@@ -3,13 +3,13 @@ use crate::lan_api::{Client as LanClient, DeviceStatus as LanDeviceStatus, LanDe
 use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient};
 use crate::service::coordinator::Coordinator;
 use crate::service::device::Device;
-use crate::service::hass::{topic_safe_id, HassClient};
+use crate::service::hass::{topic_safe_id, topic_safe_string, HassClient};
 use crate::service::iot::IotClient;
 use crate::temperature::{TemperatureScale, TemperatureValue};
-use crate::undoc_api::GoveeUndocumentedApi;
+use crate::undoc_api::{GoveeUndocumentedApi, LightEffectCategory};
 use anyhow::Context;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, Semaphore};
@@ -132,6 +132,7 @@ impl State {
             if d.name().eq_ignore_ascii_case(label)
                 || d.id.eq_ignore_ascii_case(label)
                 || topic_safe_id(d).eq_ignore_ascii_case(label)
+                || topic_safe_string(&d.id).eq_ignore_ascii_case(label)
                 || d.ip_addr()
                     .map(|ip| ip.to_string().eq_ignore_ascii_case(label))
                     .unwrap_or(false)
@@ -598,28 +599,88 @@ impl State {
 
     pub async fn device_list_scenes(&self, device: &Device) -> anyhow::Result<Vec<String>> {
         // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
+        let mut platform_scenes = vec![];
+        let mut undoc_scenes = vec![];
+
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
-                return Ok(sort_and_dedup_scenes(client.list_scene_names(info).await?));
-            }
-        }
-
-        if let Ok(categories) = GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await {
-            let mut names = vec![];
-            for cat in categories {
-                for scene in cat.scenes {
-                    for effect in scene.light_effects {
-                        if effect.scene_code != 0 {
-                            names.push(scene.scene_name);
-                            break;
-                        }
+                match client.list_scene_names(info).await {
+                    Ok(names) => platform_scenes.extend(names),
+                    Err(err) => {
+                        log::warn!("Unable to list Platform API scenes for {device}: {err:#}");
                     }
                 }
             }
-            return Ok(sort_and_dedup_scenes(names));
         }
 
-        log::trace!("Platform API unavailable: Don't know how to list scenes for {device}");
+        match GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await {
+            Ok(categories) => undoc_scenes.extend(scene_names_from_undoc_categories(categories)),
+            Err(err) => {
+                log::trace!("Undocumented scene catalog unavailable for {device}: {err:#}");
+            }
+        }
+
+        let scenes = merge_scene_name_sources(platform_scenes, undoc_scenes);
+        if scenes.is_empty() {
+            log::trace!("No scene data available for {device} from Platform or undocumented APIs");
+        }
+
+        Ok(scenes)
+    }
+
+    pub async fn device_list_capability_options(
+        &self,
+        device: &Device,
+        instance: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        if instance.eq_ignore_ascii_case("lightScene") {
+            let options = self
+                .device_list_scenes(device)
+                .await?
+                .into_iter()
+                .filter(|scene| !scene.is_empty() && !scene.starts_with("Music: "))
+                .collect::<Vec<_>>();
+
+            if !options.is_empty() {
+                return Ok(options);
+            }
+        }
+
+        if let Some(info) = &device.http_device_info {
+            if let Some(client) = self.get_platform_client().await {
+                return Ok(sort_and_dedup_scenes(
+                    client.list_capability_names(info, instance).await?,
+                ));
+            }
+        }
+
+        let options = enum_capability_names_from_device_info(device, instance);
+        if !options.is_empty() {
+            return Ok(sort_and_dedup_scenes(options));
+        }
+
+        Ok(vec![])
+    }
+
+    pub async fn device_list_music_modes(&self, device: &Device) -> anyhow::Result<Vec<String>> {
+        if let Some(info) = &device.http_device_info {
+            if let Some(client) = self.get_platform_client().await {
+                return Ok(sort_and_dedup_scenes(client.list_music_mode_names(info)?));
+            }
+
+            let options = info
+                .capability_by_instance("musicMode")
+                .and_then(|cap| cap.struct_field_by_name("musicMode"))
+                .and_then(|field| match &field.field_type {
+                    crate::platform_api::DeviceParameters::Enum { options } => {
+                        Some(options.iter().map(|opt| opt.name.to_string()).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            return Ok(sort_and_dedup_scenes(options));
+        }
 
         Ok(vec![])
     }
@@ -656,9 +717,12 @@ impl State {
                 if let Some(info) = &device.http_device_info {
                     log::info!("Using Platform API to set {device} to scene {scene}");
                     client.set_scene_by_name(info, scene).await?;
-                    self.device_mut(&device.sku, &device.id)
-                        .await
-                        .set_active_scene(Some(scene));
+                    let mut device = self.device_mut(&device.sku, &device.id).await;
+                    if let Some(mode) = scene.strip_prefix("Music: ") {
+                        device.set_active_music_mode(mode, 100, true);
+                    } else {
+                        device.set_active_scene(Some(scene));
+                    }
                     return Ok(());
                 }
             }
@@ -677,6 +741,128 @@ impl State {
         anyhow::bail!("Unable to set scene for {device}");
     }
 
+    pub async fn device_set_capability_option(
+        self: &Arc<Self>,
+        device: &Device,
+        instance: &str,
+        option: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(client) = self.get_platform_client().await {
+            if let Some(info) = &device.http_device_info {
+                log::info!("Using Platform API to set {device} {instance} to {option}");
+                client
+                    .set_capability_by_name(info, instance, option)
+                    .await?;
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene_for_instance(Some(instance), Some(option));
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("Unable to set {instance} for {device}");
+    }
+
+    pub async fn device_set_music_mode(
+        self: &Arc<Self>,
+        device: &Device,
+        mode: &str,
+    ) -> anyhow::Result<()> {
+        let (sensitivity, auto_color) = device
+            .active_music_mode()
+            .map(|music| (music.sensitivity, music.auto_color))
+            .unwrap_or((100, true));
+
+        if let Some(client) = self.get_platform_client().await {
+            if let Some(info) = &device.http_device_info {
+                log::info!("Using Platform API to set {device} music mode to {mode}");
+                client
+                    .set_music_mode(info, mode, sensitivity, auto_color)
+                    .await?;
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_music_mode(mode, sensitivity, auto_color);
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("Unable to set music mode for {device}");
+    }
+
+    pub async fn device_set_music_sensitivity(
+        self: &Arc<Self>,
+        device: &Device,
+        sensitivity: u32,
+    ) -> anyhow::Result<()> {
+        let music = device
+            .active_music_mode()
+            .cloned()
+            .or_else(|| {
+                device.active_scene_name().and_then(|scene| {
+                    scene.strip_prefix("Music: ").map(|mode| {
+                        crate::service::device::ActiveMusicModeInfo {
+                            mode: mode.to_string(),
+                            sensitivity: 100,
+                            auto_color: true,
+                        }
+                    })
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("Music mode is not currently active for {device}"))?;
+
+        if let Some(client) = self.get_platform_client().await {
+            if let Some(info) = &device.http_device_info {
+                log::info!("Using Platform API to set {device} music sensitivity to {sensitivity}");
+                client
+                    .set_music_mode(info, &music.mode, sensitivity, music.auto_color)
+                    .await?;
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .update_active_music_mode(Some(sensitivity), None)?;
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("Unable to set music sensitivity for {device}");
+    }
+
+    pub async fn device_set_music_auto_color(
+        self: &Arc<Self>,
+        device: &Device,
+        auto_color: bool,
+    ) -> anyhow::Result<()> {
+        let music = device
+            .active_music_mode()
+            .cloned()
+            .or_else(|| {
+                device.active_scene_name().and_then(|scene| {
+                    scene.strip_prefix("Music: ").map(|mode| {
+                        crate::service::device::ActiveMusicModeInfo {
+                            mode: mode.to_string(),
+                            sensitivity: 100,
+                            auto_color: true,
+                        }
+                    })
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("Music mode is not currently active for {device}"))?;
+
+        if let Some(client) = self.get_platform_client().await {
+            if let Some(info) = &device.http_device_info {
+                log::info!("Using Platform API to set {device} music autoColor to {auto_color}");
+                client
+                    .set_music_mode(info, &music.mode, music.sensitivity, auto_color)
+                    .await?;
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .update_active_music_mode(None, Some(auto_color))?;
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("Unable to set music autoColor for {device}");
+    }
+
     // Take care not to call this while you hold a mutable device
     // reference, as that will deadlock!
     pub async fn notify_of_state_change(self: &Arc<Self>, device_id: &str) -> anyhow::Result<()> {
@@ -693,8 +879,268 @@ impl State {
     }
 }
 
-pub fn sort_and_dedup_scenes(mut scenes: Vec<String>) -> Vec<String> {
-    scenes.sort_by_key(|s| s.to_ascii_lowercase());
-    scenes.dedup();
-    scenes
+pub fn sort_and_dedup_scenes(scenes: Vec<String>) -> Vec<String> {
+    let mut deduped = vec![];
+    let mut seen = HashSet::new();
+    let mut has_empty = false;
+
+    for scene in scenes {
+        if scene.is_empty() {
+            has_empty = true;
+            continue;
+        }
+
+        if seen.insert(scene.to_ascii_lowercase()) {
+            deduped.push(scene);
+        }
+    }
+
+    if has_empty {
+        deduped.insert(0, String::new());
+    }
+
+    deduped
+}
+
+fn enum_capability_names_from_device_info(device: &Device, instance: &str) -> Vec<String> {
+    let Some(info) = &device.http_device_info else {
+        return vec![];
+    };
+
+    let Some(cap) = info.capability_by_instance(instance) else {
+        return vec![];
+    };
+
+    let Some(crate::platform_api::DeviceParameters::Enum { options }) = &cap.parameters else {
+        return vec![];
+    };
+
+    options.iter().map(|opt| opt.name.to_string()).collect()
+}
+
+fn merge_scene_name_sources(
+    platform_scenes: Vec<String>,
+    undoc_scenes: Vec<String>,
+) -> Vec<String> {
+    if undoc_scenes.is_empty() {
+        return sort_and_dedup_scenes(platform_scenes);
+    }
+
+    let mut merged = undoc_scenes;
+    merged.extend(platform_scenes);
+    sort_and_dedup_scenes(merged)
+}
+
+fn scene_names_from_undoc_categories(categories: Vec<LightEffectCategory>) -> Vec<String> {
+    let mut names = vec![];
+    for cat in categories {
+        for scene in cat.scenes {
+            for effect in scene.light_effects {
+                if effect.scene_code != 0 {
+                    names.push(scene.scene_name);
+                    break;
+                }
+            }
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        merge_scene_name_sources, scene_names_from_undoc_categories, sort_and_dedup_scenes, State,
+    };
+    use crate::lan_api::LanDevice;
+    use crate::platform_api::HttpDeviceInfo;
+    use crate::undoc_api::{LightEffectCategory, LightEffectEntry, LightEffectScene};
+    use serde_json::json;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn resolve_device_matches_supported_labels_case_insensitively() {
+        let state = Arc::new(State::new());
+        let id = "AA:BB:CC:DD:EE:FF:42:2A";
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+
+        {
+            let mut device = state.device_mut("H6000", id).await;
+            device.set_lan_device(LanDevice {
+                ip,
+                device: id.to_string(),
+                sku: "H6000".to_string(),
+                ble_version_hard: String::new(),
+                ble_version_soft: String::new(),
+                wifi_version_hard: String::new(),
+                wifi_version_soft: String::new(),
+            });
+            device.http_device_info = Some(HttpDeviceInfo {
+                sku: "H6000".to_string(),
+                device: id.to_string(),
+                device_name: "Desk Lamp".to_string(),
+                device_type: Default::default(),
+                capabilities: vec![],
+            });
+        }
+
+        for label in [
+            "Desk Lamp",
+            "desk lamp",
+            id,
+            "aabbccddeeff422a",
+            "aa_bb_cc_dd_ee_ff_42_2a",
+            "H6000_422A",
+            "192.168.1.50",
+        ] {
+            let resolved = state.resolve_device(label).await;
+            assert_eq!(resolved.as_ref().map(|device| device.id.as_str()), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_device_read_only_returns_error_for_missing_device() {
+        let state = Arc::new(State::new());
+        let error = state
+            .resolve_device_read_only("missing-device")
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("device 'missing-device' not found"));
+    }
+
+    #[test]
+    fn scene_names_from_undoc_categories_only_includes_runnable_scenes() {
+        let categories = vec![LightEffectCategory {
+            category_id: 1,
+            category_name: "Life".to_string(),
+            scenes: vec![
+                LightEffectScene {
+                    scene_id: 10,
+                    icon_urls: vec![],
+                    scene_name: "Forest".to_string(),
+                    analytic_name: "forest".to_string(),
+                    scene_type: 0,
+                    scene_code: 0,
+                    scence_category_id: 1,
+                    pop_up_prompt: 0,
+                    scenes_hint: String::new(),
+                    rule: json!({}),
+                    light_effects: vec![LightEffectEntry {
+                        scence_param_id: 100,
+                        scence_name: "Forest".to_string(),
+                        scence_param: String::new(),
+                        scene_code: 1,
+                        special_effect: vec![],
+                        cmd_version: None,
+                        scene_type: 0,
+                        diy_effect_code: vec![],
+                        diy_effect_str: String::new(),
+                        rules: vec![],
+                        speed_info: json!({}),
+                    }],
+                    voice_url: String::new(),
+                    create_time: 0,
+                },
+                LightEffectScene {
+                    scene_id: 11,
+                    icon_urls: vec![],
+                    scene_name: "Broken".to_string(),
+                    analytic_name: "broken".to_string(),
+                    scene_type: 0,
+                    scene_code: 0,
+                    scence_category_id: 1,
+                    pop_up_prompt: 0,
+                    scenes_hint: String::new(),
+                    rule: json!({}),
+                    light_effects: vec![LightEffectEntry {
+                        scence_param_id: 101,
+                        scence_name: "Broken".to_string(),
+                        scence_param: String::new(),
+                        scene_code: 0,
+                        special_effect: vec![],
+                        cmd_version: None,
+                        scene_type: 0,
+                        diy_effect_code: vec![],
+                        diy_effect_str: String::new(),
+                        rules: vec![],
+                        speed_info: json!({}),
+                    }],
+                    voice_url: String::new(),
+                    create_time: 0,
+                },
+            ],
+        }];
+
+        assert_eq!(
+            scene_names_from_undoc_categories(categories),
+            vec!["Forest".to_string()]
+        );
+    }
+
+    #[test]
+    fn sort_and_dedup_scenes_preserves_first_seen_order() {
+        let merged = sort_and_dedup_scenes(vec![
+            "Sunrise".to_string(),
+            "Forest".to_string(),
+            "forest".to_string(),
+            "DIY Holiday".to_string(),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                "Sunrise".to_string(),
+                "Forest".to_string(),
+                "DIY Holiday".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_and_dedup_scenes_keeps_empty_option_first() {
+        let merged = sort_and_dedup_scenes(vec![
+            "Aurora".to_string(),
+            "".to_string(),
+            "Forest".to_string(),
+            "aurora".to_string(),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec!["".to_string(), "Aurora".to_string(), "Forest".to_string(),]
+        );
+    }
+
+    #[test]
+    fn merge_scene_name_sources_prefers_undoc_order_and_appends_platform_only_entries() {
+        let merged = merge_scene_name_sources(
+            vec![
+                "".to_string(),
+                "Rainbow-B".to_string(),
+                "Sunrise".to_string(),
+                "Work".to_string(),
+                "Music: Dynamic".to_string(),
+            ],
+            vec![
+                "Sunrise".to_string(),
+                "Aurora".to_string(),
+                "Work".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "".to_string(),
+                "Sunrise".to_string(),
+                "Aurora".to_string(),
+                "Work".to_string(),
+                "Rainbow-B".to_string(),
+                "Music: Dynamic".to_string(),
+            ]
+        );
+    }
 }

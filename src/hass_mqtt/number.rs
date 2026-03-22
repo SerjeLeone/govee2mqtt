@@ -1,7 +1,9 @@
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
-use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
+use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::service::device::Device as ServiceDevice;
-use crate::service::hass::{availability_topic, topic_safe_id, topic_safe_string, HassClient};
+use crate::service::hass::{
+    availability_topic, topic_safe_id, topic_safe_string, HassClient, IdParameter,
+};
 use crate::service::state::StateHandle;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -25,6 +27,8 @@ pub struct NumberConfig {
     pub step: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_of_measurement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_by_default: Option<bool>,
 }
 
 impl NumberConfig {
@@ -104,6 +108,7 @@ impl WorkModeNumber {
                     .or(Some(255.)),
                 step: 1f32,
                 unit_of_measurement: None,
+                enabled_by_default: None,
             },
             device_id: device.id.to_string(),
             state: state.clone(),
@@ -126,11 +131,11 @@ impl EntityInstance for WorkModeNumber {
             .as_ref()
             .ok_or_else(|| anyhow!("state_topic is None!?"))?;
 
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "number entity").await
+        else {
+            return Ok(());
+        };
 
         if let Some(cap) = device.get_state_capability_by_instance("workMode") {
             if let Some(work_mode) = cap.state.pointer("/value/workMode") {
@@ -167,6 +172,80 @@ impl EntityInstance for WorkModeNumber {
     }
 }
 
+pub struct MusicSensitivityNumber {
+    number: NumberConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl MusicSensitivityNumber {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!("gv2mqtt-{id}-music-sensitivity", id = topic_safe_id(device));
+
+        Self {
+            number: NumberConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("Music Sensitivity".to_string()),
+                    device_class: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id,
+                    entity_category: None,
+                    icon: None,
+                },
+                command_topic: format!(
+                    "gv2mqtt/{id}/set-music-sensitivity",
+                    id = topic_safe_id(device)
+                ),
+                state_topic: Some(format!(
+                    "gv2mqtt/{id}/notify-music-sensitivity",
+                    id = topic_safe_id(device)
+                )),
+                min: Some(0.0),
+                max: Some(100.0),
+                step: 1.0,
+                unit_of_measurement: Some("%"),
+                enabled_by_default: Some(false),
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for MusicSensitivityNumber {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.number.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "music sensitivity number").await
+        else {
+            return Ok(());
+        };
+
+        let value = if let Some(cap) = device.get_state_capability_by_instance("musicMode") {
+            cap.state
+                .pointer("/value/sensitivity")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.to_string())
+        } else {
+            device
+                .active_music_mode()
+                .map(|music| music.sensitivity.to_string())
+        };
+
+        if let Some(value) = value {
+            return self.number.notify_state(client, &value).await;
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 pub struct IdAndModeName {
     id: String,
@@ -192,4 +271,86 @@ pub async fn mqtt_number_command(
         .await?;
 
     Ok(())
+}
+
+pub async fn mqtt_set_music_sensitivity(
+    Payload(value): Payload<u32>,
+    Params(IdParameter { id }): Params<IdParameter>,
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    let device = state.resolve_device_for_control(&id).await?;
+
+    state.device_set_music_sensitivity(&device, value).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MusicSensitivityNumber;
+    use crate::hass_mqtt::instance::EntityInstance;
+    use crate::service::device::Device;
+    use crate::service::hass::HassClient;
+    use crate::service::state::State;
+    use std::sync::Arc;
+
+    #[test]
+    fn music_sensitivity_number_has_expected_topics_and_registry_defaults() {
+        let device = Device::new("H6000", "AA:BB");
+        let state = Arc::new(State::new());
+        let entity = MusicSensitivityNumber::new(&device, &state);
+
+        assert_eq!(
+            entity.number.base.name.as_deref(),
+            Some("Music Sensitivity")
+        );
+        assert_eq!(
+            entity.number.command_topic,
+            "gv2mqtt/AABB/set-music-sensitivity"
+        );
+        assert_eq!(
+            entity.number.state_topic.as_deref(),
+            Some("gv2mqtt/AABB/notify-music-sensitivity")
+        );
+        assert_eq!(entity.number.min, Some(0.0));
+        assert_eq!(entity.number.max, Some(100.0));
+        assert_eq!(entity.number.unit_of_measurement, Some("%"));
+        assert_eq!(entity.number.enabled_by_default, Some(false));
+
+        let _entity_trait: &dyn EntityInstance = &entity;
+    }
+
+    #[tokio::test]
+    async fn music_sensitivity_number_publishes_config_and_state_without_broker() {
+        let state = Arc::new(State::new());
+        state
+            .set_hass_disco_prefix("homeassistant".to_string())
+            .await;
+
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_active_music_mode("Spectrum", 42, true);
+        }
+
+        let device = state.device_by_id("AA:BB").await.unwrap();
+        let entity = MusicSensitivityNumber::new(&device, &state);
+        let client = HassClient::new_test();
+
+        entity.publish_config(&state, &client).await.unwrap();
+        entity.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert_eq!(
+            published[0].0,
+            "homeassistant/number/gv2mqtt-AABB-music-sensitivity/config"
+        );
+        assert!(published[0].1.contains("\"enabled_by_default\":false"));
+        assert_eq!(
+            published[1],
+            (
+                "gv2mqtt/AABB/notify-music-sensitivity".to_string(),
+                "42".to_string()
+            )
+        );
+    }
 }

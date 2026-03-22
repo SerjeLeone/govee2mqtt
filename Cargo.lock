@@ -817,6 +817,7 @@ dependencies = [
  "strum_macros",
  "thiserror 2.0.17",
  "tokio",
+ "tower",
  "tower-http",
  "uncased",
  "uuid",

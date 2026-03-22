@@ -44,6 +44,7 @@ pub struct Device {
     pub last_polled: Option<DateTime<Utc>>,
 
     active_scene: Option<ActiveSceneInfo>,
+    active_music_mode: Option<ActiveMusicModeInfo>,
 }
 
 impl std::fmt::Display for Device {
@@ -57,9 +58,19 @@ impl std::fmt::Display for Device {
 /// the color of the light is changed
 #[derive(Clone, Debug)]
 struct ActiveSceneInfo {
+    pub capability_instance: Option<String>,
     pub name: String,
     pub color: crate::lan_api::DeviceColor,
     pub kelvin: u32,
+    pub pending_observation: bool,
+    pub set_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveMusicModeInfo {
+    pub mode: String,
+    pub sensitivity: u32,
+    pub auto_color: bool,
 }
 
 /// Represents the device state; synthesized from the various
@@ -188,6 +199,20 @@ impl Device {
     pub fn set_humidifier_work_mode_and_param(&mut self, mode: u8, param: u8) {
         self.humidifier_work_mode.replace(mode);
         self.humidifier_param_by_mode.insert(mode, param);
+    }
+
+    pub fn active_scene_name(&self) -> Option<&str> {
+        self.active_scene.as_ref().map(|info| info.name.as_str())
+    }
+
+    pub fn active_scene_instance(&self) -> Option<&str> {
+        self.active_scene
+            .as_ref()
+            .and_then(|info| info.capability_instance.as_deref())
+    }
+
+    pub fn active_music_mode(&self) -> Option<&ActiveMusicModeInfo> {
+        self.active_music_mode.as_ref()
     }
 
     /// Update the LAN device information
@@ -369,38 +394,94 @@ impl Device {
 
     /// Records the active scene name
     pub fn set_active_scene(&mut self, scene: Option<&str>) {
+        self.set_active_scene_for_instance(None, scene);
+    }
+
+    pub fn set_active_scene_for_instance(&mut self, instance: Option<&str>, scene: Option<&str>) {
         match scene {
             None => {
                 self.active_scene.take();
+                self.active_music_mode.take();
             }
             Some(scene) => {
                 let (color, kelvin) = self
                     .device_state()
                     .map(|s| (s.color, s.kelvin))
                     .unwrap_or_default();
+                if instance != Some("musicMode") {
+                    self.active_music_mode.take();
+                }
                 self.active_scene.replace(ActiveSceneInfo {
+                    capability_instance: instance.map(str::to_string),
                     name: scene.to_string(),
                     color,
                     kelvin,
+                    pending_observation: true,
+                    set_at: Utc::now(),
                 });
             }
         }
     }
 
     pub fn clear_scene_if_color_changed(&mut self) {
-        if let Some(info) = &self.active_scene {
-            let current = self
-                .device_state()
-                .map(|s| (s.color, s.kelvin))
-                .unwrap_or_default();
+        let current = self
+            .device_state()
+            .map(|s| (s.color, s.kelvin))
+            .unwrap_or_default();
+
+        if let Some(info) = self.active_scene.as_mut() {
             let scene_state = (info.color, info.kelvin);
             if current != scene_state {
-                log::info!(
-                    "Clearing reported scene because current {current:?} != {scene_state:?}"
-                );
-                self.active_scene.take();
+                if info.pending_observation
+                    && Utc::now() - info.set_at <= chrono::Duration::seconds(15)
+                {
+                    log::info!(
+                        "Recording scene state transition because current {current:?} != {scene_state:?}"
+                    );
+                    info.color = current.0;
+                    info.kelvin = current.1;
+                    info.pending_observation = false;
+                } else {
+                    log::info!(
+                        "Clearing reported scene because current {current:?} != {scene_state:?}"
+                    );
+                    self.active_scene.take();
+                    self.active_music_mode.take();
+                }
+            } else if info.pending_observation
+                && Utc::now() - info.set_at > chrono::Duration::seconds(15)
+            {
+                info.pending_observation = false;
             }
         }
+    }
+
+    pub fn set_active_music_mode(&mut self, mode: &str, sensitivity: u32, auto_color: bool) {
+        self.active_music_mode.replace(ActiveMusicModeInfo {
+            mode: mode.to_string(),
+            sensitivity,
+            auto_color,
+        });
+        self.set_active_scene_for_instance(Some("musicMode"), Some(&format!("Music: {mode}")));
+    }
+
+    pub fn update_active_music_mode(
+        &mut self,
+        sensitivity: Option<u32>,
+        auto_color: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let music = self
+            .active_music_mode
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("music mode is not currently active"))?;
+
+        if let Some(sensitivity) = sensitivity {
+            music.sensitivity = sensitivity;
+        }
+        if let Some(auto_color) = auto_color {
+            music.auto_color = auto_color;
+        }
+        Ok(())
     }
 
     pub fn device_type(&self) -> DeviceType {
@@ -600,6 +681,85 @@ impl Device {
             Some(true) => false,
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Device;
+    use crate::lan_api::{DeviceColor, DeviceStatus};
+
+    #[test]
+    fn scene_transition_is_retained_until_a_later_manual_change() {
+        let mut device = Device::new("H6000", "aa:bb");
+
+        device.set_lan_device_status(DeviceStatus {
+            on: true,
+            brightness: 100,
+            color: DeviceColor { r: 255, g: 0, b: 0 },
+            color_temperature_kelvin: 0,
+        });
+
+        device.set_active_scene(Some("Sunrise"));
+
+        device.set_lan_device_status(DeviceStatus {
+            on: true,
+            brightness: 100,
+            color: DeviceColor { r: 0, g: 0, b: 255 },
+            color_temperature_kelvin: 0,
+        });
+
+        assert_eq!(
+            device.device_state().and_then(|state| state.scene),
+            Some("Sunrise".to_string())
+        );
+
+        device.set_lan_device_status(DeviceStatus {
+            on: true,
+            brightness: 100,
+            color: DeviceColor { r: 0, g: 255, b: 0 },
+            color_temperature_kelvin: 0,
+        });
+
+        assert_eq!(device.device_state().and_then(|state| state.scene), None);
+    }
+
+    #[test]
+    fn music_mode_sets_active_scene_and_tracks_music_settings() {
+        let mut device = Device::new("H6000", "aa:bb");
+
+        device.set_active_music_mode("Spectrum", 77, false);
+
+        assert_eq!(device.active_scene_name(), Some("Music: Spectrum"));
+        assert_eq!(device.active_scene_instance(), Some("musicMode"));
+
+        let music = device
+            .active_music_mode()
+            .expect("music mode should be set");
+        assert_eq!(music.mode, "Spectrum");
+        assert_eq!(music.sensitivity, 77);
+        assert!(!music.auto_color);
+
+        device
+            .update_active_music_mode(Some(42), Some(true))
+            .unwrap();
+        let music = device
+            .active_music_mode()
+            .expect("music mode should remain set");
+        assert_eq!(music.sensitivity, 42);
+        assert!(music.auto_color);
+    }
+
+    #[test]
+    fn non_music_scene_replaces_active_music_mode() {
+        let mut device = Device::new("H6000", "aa:bb");
+        device.set_active_music_mode("Rhythm", 100, true);
+
+        device.set_active_scene_for_instance(Some("lightScene"), Some("Sunrise"));
+
+        assert_eq!(device.active_scene_name(), Some("Sunrise"));
+        assert_eq!(device.active_scene_instance(), Some("lightScene"));
+        assert!(device.active_music_mode().is_none());
     }
 }
 

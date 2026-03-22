@@ -1,7 +1,7 @@
 use crate::commands::serve::POLL_INTERVAL;
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
 use crate::hass_mqtt::humidifier::DEVICE_CLASS_HUMIDITY;
-use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
+use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceCapability;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{availability_topic, topic_safe_id, topic_safe_string, HassClient};
@@ -168,11 +168,11 @@ impl EntityInstance for CapabilitySensor {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "capability sensor").await
+        else {
+            return Ok(());
+        };
 
         let quirk = device.resolve_quirk();
 
@@ -265,11 +265,11 @@ impl EntityInstance for DeviceStatusDiagnostic {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        let device = self
-            .state
-            .device_by_id(&self.device_id)
-            .await
-            .expect("device to exist");
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "device status diagnostic").await
+        else {
+            return Ok(());
+        };
 
         let iot_state = device.compute_iot_device_state();
         let lan_state = device.compute_lan_device_state();
@@ -307,5 +307,73 @@ impl EntityInstance for DeviceStatusDiagnostic {
             client.publish_obj(topic, attributes).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceStatusDiagnostic, GlobalFixedDiagnostic};
+    use crate::hass_mqtt::instance::EntityInstance;
+    use crate::lan_api::{DeviceColor, DeviceStatus};
+    use crate::service::hass::HassClient;
+    use crate::service::state::State;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn global_fixed_diagnostic_publishes_config_and_state_without_broker() {
+        let state = Arc::new(State::new());
+        state
+            .set_hass_disco_prefix("homeassistant".to_string())
+            .await;
+        let sensor = GlobalFixedDiagnostic::new("Version", "1.2.3");
+        let client = HassClient::new_test();
+
+        sensor.publish_config(&state, &client).await.unwrap();
+        sensor.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert_eq!(published[0].0, "homeassistant/sensor/global-version/config");
+        assert_eq!(
+            published[1],
+            (
+                "gv2mqtt/sensor/global-version/state".to_string(),
+                "1.2.3".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn device_status_diagnostic_publishes_summary_and_attributes_without_broker() {
+        let state = Arc::new(State::new());
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_lan_device_status(DeviceStatus {
+                on: true,
+                brightness: 100,
+                color: DeviceColor { r: 1, g: 2, b: 3 },
+                color_temperature_kelvin: 0,
+            });
+        }
+
+        let device = state.device_by_id("AA:BB").await.unwrap();
+        let sensor = DeviceStatusDiagnostic::new(&device, &state);
+        let client = HassClient::new_test();
+
+        sensor.notify_state(&client).await.unwrap();
+
+        let published = client.published_messages();
+        assert_eq!(
+            published[0],
+            (
+                "gv2mqtt/sensor/sensor-AABB-gv2mqtt-status/state".to_string(),
+                "Available".to_string()
+            )
+        );
+        assert_eq!(
+            published[1].0,
+            "gv2mqtt/sensor/sensor-AABB-gv2mqtt-status/attributes".to_string()
+        );
+        assert!(published[1].1.contains("\"overall\""));
+        assert!(published[1].1.contains("\"LAN API\""));
     }
 }

@@ -2,8 +2,11 @@ use crate::hass_mqtt::climate::mqtt_set_temperature;
 use crate::hass_mqtt::enumerator::{enumerate_all_entites, enumerate_entities_for_device};
 use crate::hass_mqtt::humidifier::{mqtt_device_set_work_mode, mqtt_humidifier_set_target};
 use crate::hass_mqtt::instance::EntityList;
-use crate::hass_mqtt::number::mqtt_number_command;
-use crate::hass_mqtt::select::mqtt_set_mode_scene;
+use crate::hass_mqtt::number::{mqtt_number_command, mqtt_set_music_sensitivity};
+use crate::hass_mqtt::select::{
+    mqtt_set_capability_option, mqtt_set_mode_scene, mqtt_set_music_mode,
+};
+use crate::hass_mqtt::switch::mqtt_set_music_auto_color;
 use crate::lan_api::DeviceColor;
 use crate::opt_env_var;
 use crate::platform_api::{from_json, DeviceType};
@@ -14,11 +17,20 @@ use anyhow::Context;
 use async_channel::Receiver;
 use mosquitto_rs::router::{MqttRouter, Params, Payload, State};
 use mosquitto_rs::{Client, Event, QoS};
+#[cfg(test)]
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc as StdArc;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 const HASS_REGISTER_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+const DISCOVERY_TOPICS_CACHE_FILE: &str = "gv2mqtt-discovery-topics.json";
 
 #[derive(clap::Parser, Debug)]
 pub struct HassArguments {
@@ -107,17 +119,50 @@ impl HassArguments {
 }
 
 #[derive(Clone)]
+enum HassClientBackend {
+    Mqtt(Client),
+    #[cfg(test)]
+    Capture(StdArc<ParkingMutex<Vec<(String, String)>>>),
+}
+
+#[derive(Clone)]
 pub struct HassClient {
-    client: Client,
+    backend: HassClientBackend,
+    published_config_topics: Arc<StdMutex<BTreeSet<String>>>,
 }
 
 impl HassClient {
+    pub fn from_client(client: Client) -> Self {
+        Self {
+            backend: HassClientBackend::Mqtt(client),
+            published_config_topics: Arc::new(StdMutex::new(BTreeSet::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        Self {
+            backend: HassClientBackend::Capture(StdArc::new(ParkingMutex::new(vec![]))),
+            published_config_topics: Arc::new(StdMutex::new(BTreeSet::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn published_messages(&self) -> Vec<(String, String)> {
+        match &self.backend {
+            HassClientBackend::Capture(messages) => messages.lock().clone(),
+            HassClientBackend::Mqtt(_) => vec![],
+        }
+    }
+
     async fn register_with_hass(&self, state: &StateHandle) -> anyhow::Result<()> {
         let entities = enumerate_all_entites(state).await?;
+        self.clear_recorded_config_topics();
 
         // Register the configs
         log::trace!("register_with_hass: register entities");
         entities.publish_config(state, self).await?;
+        self.purge_stale_discovery_topics(state).await?;
 
         // Allow hass extra time to register the entities before
         // we mark them as available
@@ -143,15 +188,148 @@ impl HassClient {
         Ok(())
     }
 
+    fn record_config_topic(&self, topic: &str) {
+        if topic.ends_with("/config") {
+            self.published_config_topics
+                .lock()
+                .expect("published_config_topics lock")
+                .insert(topic.to_string());
+        }
+    }
+
+    fn clear_recorded_config_topics(&self) {
+        self.published_config_topics
+            .lock()
+            .expect("published_config_topics lock")
+            .clear();
+    }
+
+    fn recorded_config_topics(&self) -> Vec<String> {
+        self.published_config_topics
+            .lock()
+            .expect("published_config_topics lock")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    async fn purge_stale_discovery_topics(&self, state: &StateHandle) -> anyhow::Result<()> {
+        let current_topics = self.recorded_config_topics();
+        let prior_topics = load_discovery_topics_cache();
+        let current_topic_set: BTreeSet<_> = current_topics.iter().cloned().collect();
+
+        for topic in prior_topics {
+            if current_topic_set.contains(&topic) {
+                continue;
+            }
+
+            log::info!("Removing stale Home Assistant discovery topic {topic}");
+            self.publish_retained(&topic, "").await?;
+        }
+
+        for topic in self
+            .legacy_discovery_topics_to_clear(state, &current_topic_set)
+            .await?
+        {
+            log::info!("Removing legacy Home Assistant discovery topic {topic}");
+            self.publish_retained(&topic, "").await?;
+        }
+
+        save_discovery_topics_cache(&current_topics)?;
+        Ok(())
+    }
+
+    async fn legacy_discovery_topics_to_clear(
+        &self,
+        state: &StateHandle,
+        current_topic_set: &BTreeSet<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut topics = vec![];
+
+        for device in state.devices().await {
+            if device.device_type() != DeviceType::Light {
+                continue;
+            }
+
+            let mut has_dedicated_scene_controls = false;
+            for instance in ["lightScene", "diyScene", "snapshot", "nightlightScene"] {
+                if !state
+                    .device_list_capability_options(&device, instance)
+                    .await?
+                    .is_empty()
+                {
+                    has_dedicated_scene_controls = true;
+                    break;
+                }
+            }
+
+            if !has_dedicated_scene_controls
+                && !state.device_list_music_modes(&device).await?.is_empty()
+            {
+                has_dedicated_scene_controls = true;
+            }
+
+            if !has_dedicated_scene_controls {
+                continue;
+            }
+
+            let legacy_topic = format!(
+                "{}/select/gv2mqtt-{}-mode-scene/config",
+                state.get_hass_disco_prefix().await,
+                topic_safe_id(&device)
+            );
+
+            if !current_topic_set.contains(&legacy_topic) {
+                topics.push(legacy_topic);
+            }
+        }
+
+        Ok(topics)
+    }
+
     pub async fn publish<T: AsRef<str> + std::fmt::Display, P: AsRef<[u8]> + std::fmt::Display>(
         &self,
         topic: T,
         payload: P,
     ) -> anyhow::Result<()> {
+        self.publish_with_options(topic, payload, false).await
+    }
+
+    pub async fn publish_retained<
+        T: AsRef<str> + std::fmt::Display,
+        P: AsRef<[u8]> + std::fmt::Display,
+    >(
+        &self,
+        topic: T,
+        payload: P,
+    ) -> anyhow::Result<()> {
+        self.publish_with_options(topic, payload, true).await
+    }
+
+    async fn publish_with_options<
+        T: AsRef<str> + std::fmt::Display,
+        P: AsRef<[u8]> + std::fmt::Display,
+    >(
+        &self,
+        topic: T,
+        payload: P,
+        retain: bool,
+    ) -> anyhow::Result<()> {
         log::trace!("{topic} -> {payload}");
-        self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
-            .await?;
+        let topic = topic.to_string();
+        let payload_string = payload.to_string();
+        self.record_config_topic(&topic);
+        match &self.backend {
+            HassClientBackend::Mqtt(client) => {
+                client
+                    .publish(&topic, payload_string.as_bytes(), QoS::AtMostOnce, retain)
+                    .await?;
+            }
+            #[cfg(test)]
+            HassClientBackend::Capture(messages) => {
+                messages.lock().push((topic, payload_string));
+            }
+        }
         Ok(())
     }
 
@@ -160,11 +338,38 @@ impl HassClient {
         topic: T,
         payload: P,
     ) -> anyhow::Result<()> {
+        self.publish_obj_with_options(topic, payload, false).await
+    }
+
+    pub async fn publish_obj_retained<T: AsRef<str> + std::fmt::Display, P: Serialize>(
+        &self,
+        topic: T,
+        payload: P,
+    ) -> anyhow::Result<()> {
+        self.publish_obj_with_options(topic, payload, true).await
+    }
+
+    async fn publish_obj_with_options<T: AsRef<str> + std::fmt::Display, P: Serialize>(
+        &self,
+        topic: T,
+        payload: P,
+        retain: bool,
+    ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(&payload)?;
         log::trace!("{topic} -> {payload}");
-        self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
-            .await?;
+        let topic = topic.to_string();
+        self.record_config_topic(&topic);
+        match &self.backend {
+            HassClientBackend::Mqtt(client) => {
+                client
+                    .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, retain)
+                    .await?;
+            }
+            #[cfg(test)]
+            HassClientBackend::Capture(messages) => {
+                messages.lock().push((topic, payload));
+            }
+        }
         Ok(())
     }
 
@@ -179,6 +384,32 @@ impl HassClient {
 
         Ok(())
     }
+}
+
+fn discovery_topics_cache_path() -> PathBuf {
+    let mut path = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    path.push(DISCOVERY_TOPICS_CACHE_FILE);
+    path
+}
+
+fn load_discovery_topics_cache() -> Vec<String> {
+    let path = discovery_topics_cache_path();
+    let Ok(data) = fs::read_to_string(path) else {
+        return vec![];
+    };
+
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+fn save_discovery_topics_cache(topics: &[String]) -> anyhow::Result<()> {
+    let path = discovery_topics_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec(topics)?)?;
+    Ok(())
 }
 
 pub fn topic_safe_string(s: &str) -> String {
@@ -555,6 +786,27 @@ async fn run_mqtt_loop(
             .await?;
         router
             .route(
+                "gv2mqtt/:id/set-capability-option/:instance",
+                mqtt_set_capability_option,
+            )
+            .await?;
+        router
+            .route("gv2mqtt/:id/set-music-mode", mqtt_set_music_mode)
+            .await?;
+        router
+            .route(
+                "gv2mqtt/:id/set-music-sensitivity",
+                mqtt_set_music_sensitivity,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/:id/set-music-auto-color",
+                mqtt_set_music_auto_color,
+            )
+            .await?;
+        router
+            .route(
                 "gv2mqtt/humidifier/:id/set-target",
                 mqtt_humidifier_set_target,
             )
@@ -670,9 +922,7 @@ pub async fn spawn_hass_integration(
     let subscriber = client.subscriber().expect("to own the subscriber");
 
     state
-        .set_hass_client(HassClient {
-            client: client.clone(),
-        })
+        .set_hass_client(HassClient::from_client(client.clone()))
         .await;
 
     let disco_prefix = args.hass_discovery_prefix.clone();
@@ -688,7 +938,7 @@ pub async fn spawn_hass_integration(
             std::process::exit(1);
         } else {
             log::info!("run_mqtt_loop exited. We should do something to shutdown gracefully here");
-            std::process::exit(0);
+            std::process::exit(1);
         }
     });
 
@@ -696,8 +946,14 @@ pub async fn spawn_hass_integration(
 }
 
 pub fn camel_case_to_space_separated(camel: &str) -> String {
-    let mut result = camel[..1].to_ascii_uppercase();
-    for c in camel.chars().skip(1) {
+    let mut chars = camel.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut result = String::new();
+    result.extend(first.to_uppercase());
+    for c in chars {
         if c.is_uppercase() {
             result.push(' ');
         }
@@ -713,5 +969,10 @@ fn test_camel_case_to_space_separated() {
     assert_eq!(
         camel_case_to_space_separated("oscillationToggle"),
         "Oscillation Toggle"
+    );
+    assert_eq!(camel_case_to_space_separated(""), "");
+    assert_eq!(
+        camel_case_to_space_separated("用于三灯头中的第二个"),
+        "用于三灯头中的第二个"
     );
 }

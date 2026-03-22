@@ -20,7 +20,7 @@ export class DeviceList extends LitElement {
 
   _deviceListTask = new Task(this, {
     task: async ([], {signal}) => {
-      const response = await fetch('/api/devices', {signal});
+      const response = await fetch('api/devices', {signal});
       if (!response.ok) {
         throw new Error(response.status);
       }
@@ -75,16 +75,16 @@ export class DeviceList extends LitElement {
   }
 
   _set_power_on(e) {
-    const device_id = e.target.dataset.id;
+    const device_id = encodeURIComponent(e.target.dataset.id);
     const power = e.target.checked ? 'on' : 'off';
-    fetch(`/api/device/${device_id}/power/${power}`);
+    fetch(`api/device/${device_id}/power/${power}`, {method: 'POST'});
   }
 
   _set_color(e) {
-    const device_id = e.target.dataset.id;
+    const device_id = encodeURIComponent(e.target.dataset.id);
     const color = encodeURIComponent(e.target.value);
     console.log(`color will change to ${color}`);
-    fetch(`/api/device/${device_id}/color/${color}`);
+    fetch(`api/device/${device_id}/color/${color}`, {method: 'POST'});
   }
 
   _render_item = (item) => {
@@ -103,22 +103,33 @@ export class DeviceList extends LitElement {
 
     const power_switch = html`
     <span class="form-switch"><input
-      data-id=${item.id}
-      class="form-check-input"
-      type="checkbox"
-      role="switch"
-      @click=${this._set_power_on}
-      ?checked=${item.state?.on}
+        data-id=${item.safe_id}
+        class="form-check-input"
+        type="checkbox"
+        role="switch"
+        @click=${this._set_power_on}
+        ?checked=${item.state?.on}
     ></span>`;
 
     const color_picker = html`
       <input
         class="form-control form-control-color"
-        data-id=${item.id}
+        data-id=${item.safe_id}
         @change=${this._set_color}
         type="color"
         value=${rgb_hex}>
       `;
+
+    const inspect_link = html`
+      <a
+        class="btn btn-sm btn-outline-secondary"
+        href=${`api/device/${encodeURIComponent(item.safe_id)}/inspect`}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Inspect
+      </a>
+    `;
 
     return html`
         <tr>
@@ -131,6 +142,7 @@ export class DeviceList extends LitElement {
           <td><tt>${item.id}</tt></td>
           <td style="width: 10em">${updated}</td>
           <td>${source}</td>
+          <td>${inspect_link}</td>
         </tr>
         `;
   }
@@ -149,6 +161,7 @@ export class DeviceList extends LitElement {
               <th scope="col">ID</th>
               <th scope="col">Last Updated</th>
               <th scope="col">Source</th>
+              <th scope="col">Inspect</th>
             </tr>
           </thead>
           <tbody>

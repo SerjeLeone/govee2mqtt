@@ -280,6 +280,152 @@ impl GoveeApiClient {
         Ok(result)
     }
 
+    pub async fn get_merged_enum_capability_by_instance(
+        &self,
+        device: &HttpDeviceInfo,
+        instance: &str,
+    ) -> anyhow::Result<Option<DeviceCapability>> {
+        let mut sources: Vec<Vec<DeviceCapability>> = vec![device.capabilities.clone()];
+
+        if matches!(instance, "lightScene" | "snapshot") {
+            sources.push(self.get_device_scenes(device).await?);
+        }
+        if instance == "diyScene" {
+            sources.push(self.get_device_diy_scenes(device).await?);
+        }
+        if instance == "lightScene" {
+            sources
+                .push(GoveeUndocumentedApi::synthesize_platform_api_scene_list(&device.sku).await?);
+        }
+
+        let mut merged_cap = None;
+        let mut options = vec![];
+
+        for caps in sources {
+            for cap in caps {
+                if !cap.instance.eq_ignore_ascii_case(instance) {
+                    continue;
+                }
+
+                let Some(DeviceParameters::Enum {
+                    options: cap_options,
+                }) = &cap.parameters
+                else {
+                    continue;
+                };
+
+                if merged_cap.is_none() {
+                    merged_cap.replace(cap.clone());
+                }
+
+                for opt in cap_options {
+                    if options
+                        .iter()
+                        .any(|existing: &EnumOption| existing.name.eq_ignore_ascii_case(&opt.name))
+                    {
+                        continue;
+                    }
+                    options.push(opt.clone());
+                }
+            }
+        }
+
+        let Some(mut cap) = merged_cap else {
+            return Ok(None);
+        };
+
+        cap.parameters = Some(DeviceParameters::Enum { options });
+        Ok(Some(cap))
+    }
+
+    pub async fn list_capability_names(
+        &self,
+        device: &HttpDeviceInfo,
+        instance: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let Some(cap) = self
+            .get_merged_enum_capability_by_instance(device, instance)
+            .await?
+        else {
+            return Ok(vec![]);
+        };
+
+        match cap.parameters {
+            Some(DeviceParameters::Enum { options }) => {
+                Ok(options.into_iter().map(|opt| opt.name).collect())
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub async fn set_capability_by_name(
+        &self,
+        device: &HttpDeviceInfo,
+        instance: &str,
+        option_name: &str,
+    ) -> anyhow::Result<ControlDeviceResponseCapability> {
+        let cap = self
+            .get_merged_enum_capability_by_instance(device, instance)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("device has no {instance} capability"))?;
+
+        let Some(DeviceParameters::Enum { options }) = &cap.parameters else {
+            anyhow::bail!("{instance} is not an enum capability");
+        };
+
+        let option = options
+            .iter()
+            .find(|opt| opt.name.eq_ignore_ascii_case(option_name))
+            .ok_or_else(|| anyhow::anyhow!("{option_name} is not a valid {instance} option"))?;
+
+        self.control_device(device, &cap, option.value.clone())
+            .await
+    }
+
+    pub fn list_music_mode_names(&self, device: &HttpDeviceInfo) -> anyhow::Result<Vec<String>> {
+        let Some(cap) = device.capability_by_instance("musicMode") else {
+            return Ok(vec![]);
+        };
+
+        let Some(field) = cap.struct_field_by_name("musicMode") else {
+            return Ok(vec![]);
+        };
+
+        match &field.field_type {
+            DeviceParameters::Enum { options } => {
+                Ok(options.iter().map(|opt| opt.name.to_string()).collect())
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub async fn set_music_mode(
+        &self,
+        device: &HttpDeviceInfo,
+        mode: &str,
+        sensitivity: u32,
+        auto_color: bool,
+    ) -> anyhow::Result<ControlDeviceResponseCapability> {
+        let cap = device
+            .capability_by_instance("musicMode")
+            .ok_or_else(|| anyhow::anyhow!("device has no musicMode"))?;
+        let field = cap
+            .struct_field_by_name("musicMode")
+            .ok_or_else(|| anyhow::anyhow!("musicMode field missing from capability"))?;
+
+        let Some(value) = field.field_type.enum_parameter_by_name(mode) else {
+            anyhow::bail!("{mode} is not a valid music mode");
+        };
+
+        let value = serde_json::json!({
+            "musicMode": value,
+            "sensitivity": sensitivity,
+            "autoColor": if auto_color { 1 } else { 0 },
+        });
+
+        self.control_device(device, cap, value).await
+    }
+
     pub async fn list_scene_names(&self, device: &HttpDeviceInfo) -> anyhow::Result<Vec<String>> {
         let mut result = vec![];
 
@@ -1112,6 +1258,26 @@ impl GoveeApiClient {
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
+
+    fn enum_cap(instance: &str, options: &[(&str, serde_json::Value)]) -> DeviceCapability {
+        DeviceCapability {
+            kind: DeviceCapabilityKind::Mode,
+            instance: instance.to_string(),
+            parameters: Some(DeviceParameters::Enum {
+                options: options
+                    .iter()
+                    .map(|(name, value)| EnumOption {
+                        name: (*name).to_string(),
+                        value: value.clone(),
+                        extras: HashMap::new(),
+                    })
+                    .collect(),
+            }),
+            alarm_type: None,
+            event_state: None,
+        }
+    }
 
     const SCENE_LIST: &str = include_str!("../test-data/scenes.json");
 
@@ -1161,5 +1327,108 @@ mod test {
             serde_json::to_string(&DeviceType::Other("something".to_string())).unwrap(),
             "\"something\""
         );
+    }
+
+    #[test]
+    fn list_music_mode_names_reads_struct_enum_options() {
+        let client = GoveeApiClient::new("dummy");
+        let device = HttpDeviceInfo {
+            sku: "H6000".to_string(),
+            device: "aa:bb".to_string(),
+            device_name: "Desk Lamp".to_string(),
+            device_type: DeviceType::Light,
+            capabilities: vec![DeviceCapability {
+                kind: DeviceCapabilityKind::MusicSetting,
+                instance: "musicMode".to_string(),
+                parameters: Some(DeviceParameters::Struct {
+                    fields: vec![
+                        StructField {
+                            field_name: "musicMode".to_string(),
+                            field_type: DeviceParameters::Enum {
+                                options: vec![
+                                    EnumOption {
+                                        name: "Rhythm".to_string(),
+                                        value: json!(1),
+                                        extras: HashMap::new(),
+                                    },
+                                    EnumOption {
+                                        name: "Spectrum".to_string(),
+                                        value: json!(2),
+                                        extras: HashMap::new(),
+                                    },
+                                ],
+                            },
+                            default_value: None,
+                            required: true,
+                        },
+                        StructField {
+                            field_name: "sensitivity".to_string(),
+                            field_type: DeviceParameters::Integer {
+                                unit: None,
+                                range: IntegerRange {
+                                    min: 0,
+                                    max: 100,
+                                    precision: 1,
+                                },
+                            },
+                            default_value: Some(json!(100)),
+                            required: true,
+                        },
+                    ],
+                }),
+                alarm_type: None,
+                event_state: None,
+            }],
+        };
+
+        let names = client.list_music_mode_names(&device).unwrap();
+        assert_eq!(names, vec!["Rhythm".to_string(), "Spectrum".to_string()]);
+    }
+
+    #[test]
+    fn list_music_mode_names_returns_empty_when_capability_is_missing() {
+        let client = GoveeApiClient::new("dummy");
+        let device = HttpDeviceInfo {
+            sku: "H6000".to_string(),
+            device: "aa:bb".to_string(),
+            device_name: "Desk Lamp".to_string(),
+            device_type: DeviceType::Light,
+            capabilities: vec![],
+        };
+
+        let names = client.list_music_mode_names(&device).unwrap();
+        assert!(names.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merged_enum_capability_deduplicates_local_options() {
+        let client = GoveeApiClient::new("dummy");
+        let device = HttpDeviceInfo {
+            sku: "H7160".to_string(),
+            device: "aa:bb".to_string(),
+            device_name: "Humidifier".to_string(),
+            device_type: DeviceType::Humidifier,
+            capabilities: vec![enum_cap(
+                "nightlightScene",
+                &[
+                    ("Forest", json!(1)),
+                    ("forest", json!(999)),
+                    ("Aurora", json!(2)),
+                ],
+            )],
+        };
+
+        let cap = client
+            .get_merged_enum_capability_by_instance(&device, "nightlightScene")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let Some(DeviceParameters::Enum { options }) = cap.parameters else {
+            panic!("expected enum parameters");
+        };
+
+        let names: Vec<_> = options.into_iter().map(|opt| opt.name).collect();
+        assert_eq!(names, vec!["Forest".to_string(), "Aurora".to_string()]);
     }
 }

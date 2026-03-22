@@ -1,5 +1,5 @@
 use crate::lan_api::Client as LanClient;
-use crate::platform_api::GoveeApiClient;
+use crate::platform_api::{DeviceParameters, GoveeApiClient};
 use crate::service::device::Device;
 use crate::service::hass::spawn_hass_integration;
 use crate::service::http::run_http_server;
@@ -295,6 +295,21 @@ impl ServeCommand {
                     "  Platform API: {kind}. supports_rgb={rgb} supports_brightness={bright}"
                 );
                 log::info!("                color_temp={color_temp:?} segment_rgb={segment_rgb:?}");
+
+                for instance in ["diyScene", "snapshot"] {
+                    if let Some(cap) = http_info.capability_by_instance(instance) {
+                        if matches!(
+                            &cap.parameters,
+                            Some(DeviceParameters::Enum { options }) if options.is_empty()
+                        ) {
+                            log::warn!(
+                                "  Platform API advertises {instance}, but returns no options. \
+                                 Dedicated Home Assistant controls for it cannot be published \
+                                 until Govee provides usable option data."
+                            );
+                        }
+                    }
+                }
                 log::trace!("{http_info:#?}");
             }
             if let Some(undoc) = &device.undoc_device_info {
