@@ -3,8 +3,8 @@ use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, En
 use crate::platform_api::DeviceCapability;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
-    availability_topic, camel_case_to_space_separated, switch_instance_state_topic, topic_safe_id,
-    HassClient, IdParameter,
+    camel_case_to_space_separated, device_availability_entries, switch_instance_state_topic,
+    topic_safe_id, HassClient, IdParameter,
 };
 use crate::service::state::StateHandle;
 use anyhow::Context;
@@ -34,7 +34,7 @@ impl SwitchConfig {
             inst = instance.instance
         );
         let state_topic = switch_instance_state_topic(device, &instance.instance);
-        let availability_topic = availability_topic();
+        let (availability, availability_mode) = device_availability_entries(device);
         let unique_id = format!(
             "gv2mqtt-{id}-{inst}",
             id = topic_safe_id(device),
@@ -43,7 +43,9 @@ impl SwitchConfig {
 
         Ok(Self {
             base: EntityConfig {
-                availability_topic,
+                availability_topic: String::new(),
+                availability,
+                availability_mode,
                 name: Some(camel_case_to_space_separated(&instance.instance)),
                 device_class: None,
                 origin: Origin::default(),
@@ -158,10 +160,14 @@ impl MusicAutoColorSwitch {
     pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
         let unique_id = format!("gv2mqtt-{id}-music-auto-color", id = topic_safe_id(device));
 
+        let (availability, availability_mode) = device_availability_entries(device);
+
         Self {
             switch: SwitchConfig {
                 base: EntityConfig {
-                    availability_topic: availability_topic(),
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: Some("Music Auto Color".to_string()),
                     device_class: None,
                     origin: Origin::default(),

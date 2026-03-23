@@ -4,7 +4,9 @@ use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, En
 use crate::hass_mqtt::work_mode::ParsedWorkMode;
 use crate::platform_api::{DeviceParameters, DeviceType, IntegerRange};
 use crate::service::device::Device as ServiceDevice;
-use crate::service::hass::{availability_topic, topic_safe_id, HassClient, IdParameter};
+use crate::service::hass::{
+    device_availability_entries, topic_safe_id, HassClient, IdParameter,
+};
 use crate::service::state::StateHandle;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -118,10 +120,14 @@ impl Humidifier {
             }
         }
 
+        let (availability, availability_mode) = device_availability_entries(device);
+
         Ok(Self {
             humidifier: HumidifierConfig {
                 base: EntityConfig {
-                    availability_topic: availability_topic(),
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: if matches!(
                         device.device_type(),
                         DeviceType::Humidifier | DeviceType::Dehumidifier

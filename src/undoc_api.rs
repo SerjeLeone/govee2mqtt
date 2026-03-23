@@ -615,6 +615,8 @@ pub struct OneClickComponent {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(debug_assertions, serde(deny_unknown_fields))]
 pub struct OneClick {
+    #[serde(default)]
+    pub component_id: Option<i64>,
     pub name: String,
     pub plan_type: i64,
     pub preset_id: i64,
@@ -629,6 +631,10 @@ pub struct OneClick {
     pub group_name: String,
     #[serde(default)]
     pub iot_rules: Vec<OneClickIotRule>,
+    #[serde(default)]
+    pub action_type: Option<i64>,
+    #[serde(default)]
+    pub all_sort: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -637,6 +643,8 @@ pub struct OneClick {
 pub struct OneClickIotRule {
     pub device_obj: OneClickIotRuleDevice,
     pub rule: Vec<OneClickIotRuleEntry>,
+    #[serde(default)]
+    pub cmd_group: i64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

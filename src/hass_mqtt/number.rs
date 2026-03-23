@@ -2,7 +2,7 @@ use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
 use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
-    availability_topic, topic_safe_id, topic_safe_string, HassClient, IdParameter,
+    device_availability_entries, topic_safe_id, topic_safe_string, HassClient, IdParameter,
 };
 use crate::service::state::StateHandle;
 use anyhow::anyhow;
@@ -80,7 +80,7 @@ impl WorkModeNumber {
             mode = topic_safe_string(mode_name)
         );
 
-        let availability_topic = availability_topic();
+        let (availability, availability_mode) = device_availability_entries(device);
         let unique_id = format!(
             "gv2mqtt-{id}-{mode}-number",
             id = topic_safe_id(device),
@@ -90,7 +90,9 @@ impl WorkModeNumber {
         Self {
             number: NumberConfig {
                 base: EntityConfig {
-                    availability_topic,
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: Some(label),
                     device_class: None,
                     origin: Origin::default(),
@@ -182,10 +184,14 @@ impl MusicSensitivityNumber {
     pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
         let unique_id = format!("gv2mqtt-{id}-music-sensitivity", id = topic_safe_id(device));
 
+        let (availability, availability_mode) = device_availability_entries(device);
+
         Self {
             number: NumberConfig {
                 base: EntityConfig {
-                    availability_topic: availability_topic(),
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: Some("Music Sensitivity".to_string()),
                     device_class: None,
                     origin: Origin::default(),

@@ -15,10 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
+    - name: Pull mosquitto image for integration tests
+      run: docker pull eclipse-mosquitto:2
     - name: Build
       run: cargo build --all
-    - name: Run tests
-      run: cargo test --all -- --show-output
+    - name: Run unit tests
+      run: cargo test --lib -- --show-output
+    - name: Run LAN simulator tests
+      run: cargo test --test lan_simulator -- --show-output
+    - name: Run MQTT integration tests
+      run: cargo test --test mqtt_integration -- --test-threads=1 --show-output
     - name: Check formatting
       run: cargo fmt --all -- --check
-

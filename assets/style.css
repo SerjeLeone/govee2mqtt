@@ -1,0 +1,101 @@
+/* Govee2MQTT Web UI Styles */
+
+/* Make table responsive on small screens */
+.gv-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Device rows */
+.gv-device-row {
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+.gv-device-row:hover {
+  background-color: var(--bs-tertiary-bg);
+}
+
+/* Status dot */
+.gv-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.gv-status-dot.online { background: #198754; }
+.gv-status-dot.offline { background: #6c757d; }
+
+/* Toast notifications */
+.gv-toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9999;
+}
+.gv-toast {
+  padding: 10px 16px;
+  border-radius: 8px;
+  color: white;
+  font-size: 0.9em;
+  margin-top: 8px;
+  animation: gv-fade-in 0.2s ease-out;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.gv-toast.success { background: #198754; }
+.gv-toast.error { background: #dc3545; }
+.gv-toast.info { background: #0d6efd; }
+
+@keyframes gv-fade-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Brightness value label */
+.gv-brightness-label {
+  font-size: 0.75em;
+  color: var(--bs-secondary-color);
+  min-width: 28px;
+  text-align: right;
+}
+
+/* Detail panel */
+.gv-detail-panel {
+  animation: gv-slide-down 0.2s ease-out;
+}
+@keyframes gv-slide-down {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 600px; }
+}
+
+/* Empty state */
+.gv-empty-state {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--bs-secondary-color);
+}
+.gv-empty-state h5 { color: var(--bs-body-color); }
+
+/* Scene select */
+.gv-scene-select {
+  max-width: 180px;
+  font-size: 0.85em;
+}
+
+/* Mobile: stack controls vertically */
+@media (max-width: 768px) {
+  .gv-device-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .gv-scene-select { max-width: 100%; }
+}
+
+/* Log viewer auto-scroll indicator */
+.gv-log-container {
+  height: 500px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 0.8em;
+}

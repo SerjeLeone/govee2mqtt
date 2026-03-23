@@ -1,7 +1,9 @@
 target
 .*sw?
 .env
+.DS_Store
 docker-target
 node_modules
 package.json
 package-lock.json
+CLAUDE.md

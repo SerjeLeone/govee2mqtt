@@ -1,13 +1,16 @@
 name: Govee to MQTT Bridge
-image: ghcr.io/wez/govee2mqtt-{arch}
+image: ghcr.io/sitapix/govee2mqtt-{arch}
 version: "2025.11.25-60a39bcc"
 slug: govee2mqtt
 description: Control Govee Devices
-url: https://github.com/wez/govee2mqtt
+url: https://github.com/sitapix/govee2mqtt
+breaking_versions:
+  - "2025.11.25-60a39bcc"
 arch:
   - amd64
   - aarch64
 init: false
+boot: auto
 startup: services
 services:
   - mqtt:need
@@ -42,3 +45,5 @@ schema:
   broadcast_all: "bool?"
   global_broadcast: "bool?"
   scan: "str?"
+  disable_effects: "bool?"
+  allowed_effects: "str?"

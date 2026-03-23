@@ -80,6 +80,51 @@ async fn require_ingress_source(
     next.run(request).await
 }
 
+fn get_auth_token() -> Option<String> {
+    std::env::var("GOVEE_HTTP_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
+async fn require_auth_token(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(expected) = get_auth_token() else {
+        return next.run(request).await;
+    };
+
+    // Skip auth for the health endpoint
+    if request.uri().path() == "/api/health" {
+        return next.run(request).await;
+    }
+
+    // Check Authorization: Bearer <token> header
+    let authorized = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| token.trim() == expected.trim())
+        .unwrap_or(false)
+        // Also check ?token= query parameter (for browser/WebSocket use)
+        || request
+            .uri()
+            .query()
+            .and_then(|q| {
+                q.split('&')
+                    .find_map(|pair| pair.strip_prefix("token="))
+            })
+            .map(|token| token == expected.trim())
+            .unwrap_or(false);
+
+    if authorized {
+        next.run(request).await
+    } else {
+        response_with_code(StatusCode::UNAUTHORIZED, "invalid or missing auth token")
+    }
+}
+
 async fn resolve_device_for_control(
     state: &StateHandle,
     id: &str,
@@ -221,6 +266,51 @@ async fn device_set_scene(
 }
 
 /// Returns a JSON array of the available scene names for a given device
+/// Send arbitrary ptReal command payloads to a device over LAN.
+/// Body: {"command": ["base64_payload1", "base64_payload2"]}
+async fn device_send_ptreal(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, Response> {
+    let device = resolve_device_for_control(&state, &id).await?;
+
+    let commands: Vec<String> = body
+        .get("command")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .ok_or_else(|| bad_request("body must have a 'command' array of base64 strings"))?;
+
+    if commands.is_empty() {
+        return Err(bad_request("command array is empty"));
+    }
+
+    if let Some(lan_dev) = &device.lan_device {
+        log::info!("Sending ptReal to {device} via LAN ({} commands)", commands.len());
+        lan_dev
+            .send_real(commands)
+            .await
+            .map_err(generic)?;
+    } else if let Some(iot) = state.get_iot_client().await {
+        if let Some(info) = &device.undoc_device_info {
+            log::info!("Sending ptReal to {device} via IoT ({} commands)", commands.len());
+            iot.send_real(&info.entry, commands)
+                .await
+                .map_err(generic)?;
+        } else {
+            return Err(generic("device has no IoT info"));
+        }
+    } else {
+        return Err(generic("no LAN or IoT API available for ptReal"));
+    }
+
+    Ok(response_with_code(StatusCode::OK, "ok"))
+}
+
 async fn device_list_scenes(
     State(state): State<StateHandle>,
     Path(id): Path<String>,
@@ -376,7 +466,7 @@ async fn inspect_device(
         sku: device.sku.clone(),
         id: device.id.clone(),
         name: device.name(),
-        room: device.room_name().map(str::to_string),
+        room: device.room_name(),
         current_state: device.device_state(),
         active_scene: device.active_scene_name().map(str::to_string),
         active_scene_instance: device.active_scene_instance().map(str::to_string),
@@ -437,6 +527,92 @@ async fn activate_one_click(
     Ok(response_with_code(StatusCode::OK, "ok"))
 }
 
+async fn get_config() -> Response {
+    let config = crate::service::device_config::current_config();
+    Json(&*config).into_response()
+}
+
+async fn put_config(Json(body): Json<serde_json::Value>) -> Result<Response, Response> {
+    let config: crate::service::device_config::DeviceConfigFile =
+        serde_json::from_value(body)
+            .map_err(|e| bad_request(format!("Invalid config JSON: {e}")))?;
+
+    crate::service::device_config::save_config(&config).map_err(generic)?;
+
+    Ok(response_with_code(StatusCode::OK, "Config saved"))
+}
+
+async fn health_check(State(state): State<StateHandle>) -> Response {
+    let devices = state.devices().await;
+    let now = chrono::Utc::now();
+    let mut online = 0u32;
+    for device in &devices {
+        let stale = device.preferred_poll_interval() * 3;
+        let is_online = device
+            .last_polled
+            .or(device.last_lan_device_status_update)
+            .or(device.last_iot_device_status_update)
+            .or(device.last_http_device_state_update)
+            .map(|last| now - last < stale)
+            .unwrap_or(false);
+        if is_online {
+            online += 1;
+        }
+    }
+
+    // Process memory usage (RSS) on Linux/macOS
+    let memory_mb = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| (pages * 4096) / (1024 * 1024)) // pages to MB
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": crate::version_info::govee_version(),
+        "devices": devices.len(),
+        "devices_online": online,
+        "push": {
+            "connected": state.push_connected.load(std::sync::atomic::Ordering::Relaxed),
+            "events_received": state.push_event_count.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "process": {
+            "memory_mb": memory_mb,
+            "uptime_sec": std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        },
+    }))
+    .into_response()
+}
+
+async fn api_logs() -> Response {
+    let logs = crate::service::log_capture::recent_logs();
+    Json(logs).into_response()
+}
+
+async fn ws_logs(ws: axum::extract::WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_log_websocket)
+}
+
+async fn handle_log_websocket(mut socket: axum::extract::ws::WebSocket) {
+    let mut rx = crate::service::log_capture::subscribe();
+
+    while let Ok(entry) = rx.recv().await {
+        let Ok(json) = serde_json::to_string(&entry) else {
+            continue;
+        };
+        if socket
+            .send(axum::extract::ws::Message::Text(json.into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 async fn serve_index(headers: HeaderMap) -> Html<String> {
     Html(INDEX_TEMPLATE.replace("__BASE_HREF__", &ingress_base_href(&headers)))
 }
@@ -445,6 +621,9 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
     let mut app = Router::new()
         .route("/", get(serve_index))
         .route("/assets/index.html", get(serve_index))
+        .route("/api/health", get(health_check))
+        .route("/api/logs", get(api_logs))
+        .route("/api/ws/logs", get(ws_logs))
         .route("/api/devices", get(list_devices))
         .route("/api/device/{id}/power/on", post(device_power_on))
         .route("/api/device/{id}/power/off", post(device_power_off))
@@ -459,7 +638,9 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
         .route("/api/device/{id}/inspect", get(inspect_device))
         .route("/api/device/{id}/color/{color}", post(device_set_color))
         .route("/api/device/{id}/scene/{scene}", post(device_set_scene))
+        .route("/api/device/{id}/ptreal", post(device_send_ptreal))
         .route("/api/device/{id}/scenes", get(device_list_scenes))
+        .route("/api/config", get(get_config).put(put_config))
         .route("/api/oneclicks", get(list_one_clicks))
         .route("/api/oneclick/activate/{scene}", post(activate_one_click))
         .nest_service("/assets", ServeDir::new("assets"))
@@ -467,6 +648,10 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
 
     if ingress_only {
         app = app.layer(middleware::from_fn(require_ingress_source));
+    }
+
+    if get_auth_token().is_some() {
+        app = app.layer(middleware::from_fn(require_auth_token));
     }
 
     app
@@ -641,6 +826,146 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_valid_json() {
+        let state = StateHandle::default();
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string());
+        assert_eq!(json["devices"], 0);
+        assert_eq!(json["devices_online"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_counts_devices() {
+        let state = StateHandle::default();
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "H6000".to_string(),
+                device: "AA:BB".to_string(),
+                device_name: "Test Lamp".to_string(),
+                device_type: crate::platform_api::DeviceType::Light,
+                capabilities: vec![],
+            });
+        }
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["devices"], 1);
+    }
+
+    #[tokio::test]
+    async fn devices_endpoint_returns_array() {
+        let state = StateHandle::default();
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn nonexistent_device_returns_not_found() {
+        let state = StateHandle::default();
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/device/does-not-exist/scenes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn invalid_color_returns_bad_request() {
+        let state = StateHandle::default();
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "H6000".to_string(),
+                device: "AA:BB".to_string(),
+                device_name: "Test".to_string(),
+                device_type: crate::platform_api::DeviceType::Light,
+                capabilities: vec![],
+            });
+        }
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/AABB/color/not-a-color")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_api_route_returns_not_found() {
+        let state = StateHandle::default();
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 

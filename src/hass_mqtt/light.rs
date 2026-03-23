@@ -3,7 +3,7 @@ use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, En
 use crate::platform_api::DeviceType;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
-    availability_topic, kelvin_to_mired, light_segment_state_topic, light_state_topic,
+    device_availability_entries, kelvin_to_mired, light_segment_state_topic, light_state_topic,
     topic_safe_id, HassClient,
 };
 use crate::service::state::StateHandle;
@@ -146,6 +146,33 @@ impl EntityInstance for DeviceLight {
     }
 }
 
+fn effects_disabled() -> bool {
+    std::env::var("GOVEE_DISABLE_EFFECTS")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn filter_effects(scenes: Vec<String>) -> Vec<String> {
+    let allowed = std::env::var("GOVEE_ALLOWED_EFFECTS").ok();
+    match allowed {
+        Some(allowed) if !allowed.trim().is_empty() => {
+            let allowed: Vec<String> = allowed
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            scenes
+                .into_iter()
+                .filter(|s| {
+                    s.is_empty() || allowed.iter().any(|a| a == &s.to_ascii_lowercase())
+                })
+                .collect()
+        }
+        _ => scenes,
+    }
+}
+
 impl DeviceLight {
     fn supports_color_mode(&self, mode: &str) -> bool {
         self.light
@@ -172,26 +199,47 @@ impl DeviceLight {
 
         let icon = match segment {
             Some(_) => None,
-            None if device_type == DeviceType::Light => quirk.as_ref().map(|q| q.icon.to_string()),
-            None => None,
+            None => {
+                // User config override > quirk > none
+                let config_icon = crate::service::device_config::get_device_override(
+                    &device.id,
+                    &device.sku,
+                )
+                .and_then(|ovr| ovr.icon);
+
+                config_icon.or_else(|| {
+                    if device_type == DeviceType::Light {
+                        quirk.as_ref().map(|q| q.icon.to_string())
+                    } else {
+                        None
+                    }
+                })
+            }
         };
 
         let state_topic = match segment {
             Some(seg) => light_segment_state_topic(device, seg),
             None => light_state_topic(device),
         };
-        let availability_topic = availability_topic();
+        let (availability, availability_mode) = device_availability_entries(device);
         let unique_id = format!(
             "gv2mqtt-{id}{seg}",
             id = topic_safe_id(device),
             seg = segment.map(|n| format!("-{n}")).unwrap_or(String::new())
         );
 
-        let effect_list = if segment.is_some() {
+        let device_effects_disabled = crate::service::device_config::get_device_override(
+            &device.id,
+            &device.sku,
+        )
+        .and_then(|ovr| ovr.disable_effects)
+        .unwrap_or(false);
+
+        let effect_list = if segment.is_some() || effects_disabled() || device_effects_disabled {
             vec![]
         } else {
             match state.device_list_scenes(device).await {
-                Ok(scenes) => scenes,
+                Ok(scenes) => filter_effects(scenes),
                 Err(err) => {
                     log::error!("Unable to list scenes for {device}: {err:#}");
                     vec![]
@@ -234,7 +282,9 @@ impl DeviceLight {
         Ok(Self {
             light: LightConfig {
                 base: EntityConfig {
-                    availability_topic,
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name,
                     device_class: None,
                     origin: Origin::default(),
@@ -249,7 +299,7 @@ impl DeviceLight {
                 supported_color_modes,
                 brightness,
                 brightness_scale: 100,
-                effect: true,
+                effect: !effect_list.is_empty(),
                 effect_list,
                 payload_available: "online".to_string(),
                 max_mireds,

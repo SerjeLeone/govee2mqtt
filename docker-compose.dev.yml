@@ -1,0 +1,47 @@
+## Local development stack
+##
+## Usage:
+##   cp .env.example .env        # edit with your Govee credentials
+##   make dev-up                 # build from source + start Mosquitto + govee2mqtt
+##   make dev-down               # stop everything
+##   make dev-logs               # tail logs
+##
+## Web UI:    http://localhost:8056
+## MQTT:      localhost:1883
+## Health:    http://localhost:8056/api/health
+##
+## Note: On macOS, Docker Desktop doesn't support network_mode: host.
+## LAN device discovery requires Linux host networking or running natively.
+
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: govee2mqtt-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - mqtt-data:/mosquitto/data
+    command: ["sh", "-c", "printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' > /tmp/m.conf && mosquitto -c /tmp/m.conf -v"]
+
+  govee2mqtt:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: govee2mqtt-dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GOVEE_MQTT_HOST: mqtt
+      GOVEE_MQTT_PORT: "1883"
+    ports:
+      - "8056:8056"
+    depends_on:
+      - mqtt
+    volumes:
+      - govee-data:/data
+
+volumes:
+  mqtt-data:
+  govee-data:

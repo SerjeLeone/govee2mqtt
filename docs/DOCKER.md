@@ -1,41 +1,19 @@
 # Running govee2mqtt in Docker
 
-To deploy in docker:
+## Quick Start
 
 1. Ensure that you have configured the MQTT integration in Home Assistant.
 
     * [follow these steps](https://www.home-assistant.io/integrations/mqtt/#configuration)
 
-2. Set up a `.env` file.  Here's a skeleton file; you will need to populate
-   the values with things that make sense in your environment.
-   See [CONFIG.md](CONFIG.md) for more details.
+2. Copy the example environment file and fill in your values:
 
 ```bash
-# Optional, but strongly recommended
-GOVEE_EMAIL=user@example.com
-GOVEE_PASSWORD=secret
-# Optional, but recommended
-GOVEE_API_KEY=UUID
-
-GOVEE_MQTT_HOST=mqtt
-GOVEE_MQTT_PORT=1883
-# Uncomment if your mqtt broker requires authentication
-#GOVEE_MQTT_USER=user
-#GOVEE_MQTT_PASSWORD=password
-
-# Specify the temperature scale to use, either C for Celsius
-# or F for Fahrenheit
-GOVEE_TEMPERATURE_SCALE=C
-
-# Always use colorized output
-RUST_LOG_STYLE=always
-
-# If you are asked to set the debug level, uncomment the next line
-#RUST_LOG=govee=trace
-
-# Set the timezone for timestamps in the log
-TZ=America/Phoenix
+cp .env.example .env
+# Edit .env with your Govee credentials and MQTT broker details
 ```
+
+See [CONFIG.md](CONFIG.md) for a complete list of configuration options.
 
 3. Set up your `docker-compose.yml`:
 
@@ -43,14 +21,14 @@ TZ=America/Phoenix
 name: govee2mqtt
 services:
   govee2mqtt:
-    image: ghcr.io/wez/govee2mqtt:latest
+    image: ghcr.io/sitapix/govee2mqtt:latest
     container_name: govee2mqtt
     restart: unless-stopped
     env_file:
       - .env
-    # Host networking is required
+    # Host networking is required for LAN discovery
     network_mode: host
-# By default, a Docker volume will be used to persist data. If you prefer to mount this on your host, you can do so as follows:
+# Optionally mount the data directory for persistent config and cache:
 #    volumes:
 #      - '/path/to/data:/data'
 ```
@@ -61,9 +39,45 @@ services:
 $ docker compose up -d
 ```
 
-5. If you need to review the logs:
+5. Your devices should appear in the MQTT integration in Home Assistant.
+
+6. Access the Web UI at `http://<your-host>:8056`
+
+7. Check health: `http://<your-host>:8056/api/health`
+
+8. Review logs:
 
 ```console
 $ docker logs govee2mqtt --follow
 ```
 
+## Per-Device Configuration
+
+Create a `govee-device-config.json` file in your data directory to customize
+device names, color temperature ranges, icons, and more. The file is automatically
+hot-reloaded — no restart needed. See [CONFIG.md](CONFIG.md) for the full format.
+
+## External Quirks
+
+If a device isn't recognized, you can add it via `govee-quirks.json` in your
+data directory. See [CONFIG.md](CONFIG.md) for the format.
+
+## HTTP API Authentication
+
+Set `GOVEE_HTTP_AUTH_TOKEN` in your `.env` to require authentication for API access.
+The `/api/health` endpoint is always accessible without a token.
+
+## Development Setup
+
+For building from source and running locally with a test MQTT broker:
+
+```bash
+cp .env.example .env
+make dev-up        # builds from source + starts Mosquitto + govee2mqtt
+make dev-logs      # tail logs
+make dev-rebuild   # rebuild after code changes
+make dev-down      # stop everything
+```
+
+This uses `Dockerfile.dev` (multi-stage source build) and `docker-compose.dev.yml`
+(includes Mosquitto broker).

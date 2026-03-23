@@ -4,11 +4,28 @@ use crate::version_info::govee_version;
 use serde::Serialize;
 
 const MODEL: &str = "gv2mqtt";
-const URL: &str = "https://github.com/wez/govee2mqtt";
+const URL: &str = "https://github.com/sitapix/govee2mqtt";
+
+#[derive(Serialize, Clone, Debug)]
+pub struct AvailabilityEntry {
+    pub topic: String,
+}
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct EntityConfig {
+    /// Single availability topic. Used when `availability` list is empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub availability_topic: String,
+
+    /// List of availability topics. When non-empty, `availability_topic` is skipped.
+    /// HA checks all topics — entity is available only when ALL report "online".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub availability: Vec<AvailabilityEntry>,
+
+    /// "all" = available when ALL topics say online. "any" = available when ANY does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability_mode: Option<String>,
+
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_class: Option<&'static str>,

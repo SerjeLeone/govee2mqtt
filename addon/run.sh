@@ -5,6 +5,17 @@ export RUST_LOG_STYLE=always
 export XDG_CACHE_HOME=/data
 export GOVEE_HTTP_INGRESS_ONLY=1
 
+# Propagate timezone from Home Assistant
+export TZ="$(bashio::supervisor.timezone)"
+
+# Generic config-to-env helper
+export_config() {
+  local key="$1" var="$2"
+  if bashio::config.has_value "$key" ; then
+    export "$var"="$(bashio::config "$key")"
+  fi
+}
+
 wait_for_mqtt() {
   local max_attempts=30
   local attempt=1
@@ -28,6 +39,7 @@ wait_for_mqtt() {
   return 1
 }
 
+# MQTT configuration
 if bashio::config.has_value mqtt_host ; then
   export GOVEE_MQTT_HOST="$(bashio::config mqtt_host)"
 else
@@ -40,53 +52,20 @@ else
   export GOVEE_MQTT_PASSWORD="$(bashio::services mqtt 'password')"
 fi
 
-if bashio::config.has_value mqtt_port ; then
-  export GOVEE_MQTT_PORT="$(bashio::config mqtt_port)"
-fi
-
-if bashio::config.has_value mqtt_username ; then
-  export GOVEE_MQTT_USER="$(bashio::config mqtt_username)"
-fi
-
-if bashio::config.has_value mqtt_password ; then
-  export GOVEE_MQTT_PASSWORD="$(bashio::config mqtt_password)"
-fi
-
-if bashio::config.has_value debug_level ; then
-  export RUST_LOG="$(bashio::config debug_level)"
-fi
-
-if bashio::config.has_value govee_email ; then
-  export GOVEE_EMAIL="$(bashio::config govee_email)"
-fi
-
-if bashio::config.has_value govee_password ; then
-  export GOVEE_PASSWORD="$(bashio::config govee_password)"
-fi
-
-if bashio::config.has_value govee_api_key ; then
-  export GOVEE_API_KEY="$(bashio::config govee_api_key)"
-fi
-
-if bashio::config.has_value no_multicast ; then
-  export GOVEE_LAN_NO_MULTICAST="$(bashio::config no_multicast)"
-fi
-
-if bashio::config.has_value broadcast_all ; then
-  export GOVEE_LAN_BROADCAST_ALL="$(bashio::config broadcast_all)"
-fi
-
-if bashio::config.has_value global_broadcast ; then
-  export GOVEE_LAN_BROADCAST_GLOBAL="$(bashio::config global_broadcast)"
-fi
-
-if bashio::config.has_value scan ; then
-  export GOVEE_LAN_SCAN="$(bashio::config scan)"
-fi
-
-if bashio::config.has_value temperature_scale ; then
-  export GOVEE_TEMPERATURE_SCALE="$(bashio::config temperature_scale)"
-fi
+export_config mqtt_port         GOVEE_MQTT_PORT
+export_config mqtt_username     GOVEE_MQTT_USER
+export_config mqtt_password     GOVEE_MQTT_PASSWORD
+export_config debug_level       RUST_LOG
+export_config govee_email       GOVEE_EMAIL
+export_config govee_password    GOVEE_PASSWORD
+export_config govee_api_key     GOVEE_API_KEY
+export_config no_multicast      GOVEE_LAN_NO_MULTICAST
+export_config broadcast_all     GOVEE_LAN_BROADCAST_ALL
+export_config global_broadcast  GOVEE_LAN_BROADCAST_GLOBAL
+export_config scan              GOVEE_LAN_SCAN
+export_config temperature_scale GOVEE_TEMPERATURE_SCALE
+export_config disable_effects   GOVEE_DISABLE_EFFECTS
+export_config allowed_effects   GOVEE_ALLOWED_EFFECTS
 
 env | grep GOVEE_ | sed -r 's/_(EMAIL|KEY|PASSWORD)=.*/_\1=REDACTED/'
 set -x

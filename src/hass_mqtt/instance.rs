@@ -2,7 +2,6 @@ use crate::hass_mqtt::base::EntityConfig;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::HassClient;
 use crate::service::state::StateHandle;
-use anyhow::Context;
 use async_trait::async_trait;
 use serde::Serialize;
 use std::sync::Arc;
@@ -69,9 +68,9 @@ impl EntityList {
         // Allow HASS time to process each entity before registering the next
         let delay = tokio::time::Duration::from_millis(100);
         for e in &self.entities {
-            e.publish_config(state, client)
-                .await
-                .context("EntityList::publish_config")?;
+            if let Err(err) = e.publish_config(state, client).await {
+                log::warn!("EntityList::publish_config: {err:#}");
+            }
             tokio::time::sleep(delay).await;
         }
         Ok(())
@@ -79,9 +78,9 @@ impl EntityList {
 
     pub async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
         for e in &self.entities {
-            e.notify_state(client)
-                .await
-                .context("EntityList::notify_state")?;
+            if let Err(err) = e.notify_state(client).await {
+                log::warn!("EntityList::notify_state: {err:#}");
+            }
         }
         Ok(())
     }

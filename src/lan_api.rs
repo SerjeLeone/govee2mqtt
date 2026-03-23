@@ -19,8 +19,13 @@ use tokio::time::Instant;
 /// The port on which govee devices listen for scan requests
 const SCAN_PORT: u16 = 4001;
 /// The port on which a client needs to listen to receive responses
-/// from govee devices
-const LISTEN_PORT: u16 = 4002;
+/// from govee devices. Can be overridden with GOVEE_LAN_LISTEN_PORT.
+fn listen_port() -> u16 {
+    std::env::var("GOVEE_LAN_LISTEN_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4002)
+}
 /// The port on which govee devices listen for control requests
 const CMD_PORT: u16 = 4003;
 /// The multicast group of which govee LAN-API enabled devices are members
@@ -244,6 +249,25 @@ impl LanDevice {
         .await
     }
 
+    /// Set color of a single segment via the LAN ptReal binary protocol.
+    /// Reverse-engineered packet format from alexluckett/govee2mqtt-segment-control.
+    /// Format: 0x33 0x05 0x15 0x01 R G B 0x00*5 SEG_MASK_LO SEG_MASK_HI [pad] CHECKSUM
+    pub async fn send_segment_color_rgb(
+        &self,
+        segment: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> anyhow::Result<()> {
+        let mask: u16 = 1u16.checked_shl(segment).unwrap_or(0);
+        let bytes = Base64HexBytes::with_bytes(vec![
+            0x33, 0x05, 0x15, 0x01, r, g, b, 0x00, 0x00, 0x00, 0x00, 0x00,
+            (mask & 0xff) as u8,
+            (mask >> 8) as u8,
+        ]);
+        self.send_real(bytes.base64()).await
+    }
+
     pub async fn send_real(&self, commands: Vec<String>) -> anyhow::Result<()> {
         self.send_request(Request::PtReal { command: commands })
             .await
@@ -454,15 +478,17 @@ async fn lan_disco(
     options: DiscoOptions,
     inner: Arc<ClientInner>,
 ) -> anyhow::Result<Receiver<LanDevice>> {
-    let listen = UdpSocket::bind(("0.0.0.0", LISTEN_PORT)).await.context(
-        "Cannot bind to UDP Port 4002, which is required \
-        for the Govee LAN API to function. Most likely cause is that you \
-        are running another integration (perhaps `Govee LAN Control`, or \
-        `homebridge-govee`) that is already bound to that port. \
-        Both cannot run on the same machine at the same time. \
-        Consider disabling `Govee LAN Control` or setting `lanDisable` in \
-        `homebridge-govee`.",
-    )?;
+    let port = listen_port();
+    let listen = UdpSocket::bind(("0.0.0.0", port)).await.with_context(|| {
+        format!(
+            "Cannot bind to UDP port {port}, which is required \
+            for the Govee LAN API to function. Most likely cause is that you \
+            are running another integration (perhaps `Govee LAN Control`, \
+            `homebridge-govee`, or the Matter Server) that is already bound \
+            to that port. Set GOVEE_LAN_LISTEN_PORT to use a different port, \
+            or disable the conflicting integration."
+        )
+    })?;
     let (tx, rx) = channel(8);
 
     async fn process_packet(

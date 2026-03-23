@@ -1,111 +1,4 @@
-use crate::lan_api::LanDiscoArguments;
-use crate::platform_api::GoveeApiArguments;
-use crate::service::hass::HassArguments;
-use crate::undoc_api::{should_log_sensitive_data, UndocApiArguments};
-use anyhow::Context;
 use clap::Parser;
-use std::str::FromStr;
-
-mod ble;
-mod cache;
-mod commands;
-mod hass_mqtt;
-mod lan_api;
-#[macro_use]
-mod platform_api;
-mod rest_api;
-mod service;
-mod temperature;
-mod undoc_api;
-mod version_info;
-
-#[derive(clap::Parser, Debug)]
-#[command(version = version_info::govee_version(),  propagate_version=true)]
-pub struct Args {
-    #[command(flatten)]
-    api_args: GoveeApiArguments,
-    #[command(flatten)]
-    lan_disco_args: LanDiscoArguments,
-    #[command(flatten)]
-    undoc_args: UndocApiArguments,
-    #[command(flatten)]
-    hass_args: HassArguments,
-
-    #[command(subcommand)]
-    cmd: SubCommand,
-}
-
-#[derive(clap::Parser, Debug)]
-pub enum SubCommand {
-    LanControl(commands::lan_control::LanControlCommand),
-    LanDisco(commands::lan_disco::LanDiscoCommand),
-    ListHttp(commands::list_http::ListHttpCommand),
-    List(commands::list::ListCommand),
-    HttpControl(commands::http_control::HttpControlCommand),
-    Serve(commands::serve::ServeCommand),
-    Undoc(commands::undoc::UndocCommand),
-}
-
-impl Args {
-    pub async fn run(&self) -> anyhow::Result<()> {
-        match &self.cmd {
-            SubCommand::LanControl(cmd) => cmd.run(self).await,
-            SubCommand::LanDisco(cmd) => cmd.run(self).await,
-            SubCommand::ListHttp(cmd) => cmd.run(self).await,
-            SubCommand::HttpControl(cmd) => cmd.run(self).await,
-            SubCommand::List(cmd) => cmd.run(self).await,
-            SubCommand::Serve(cmd) => cmd.run(self).await,
-            SubCommand::Undoc(cmd) => cmd.run(self).await,
-        }
-    }
-}
-
-pub fn opt_env_var<T: FromStr>(name: &str) -> anyhow::Result<Option<T>>
-where
-    <T as FromStr>::Err: std::fmt::Display,
-{
-    // Take care: should_log_sensitive_data can recursively call us
-    // with name="GOVEE_LOG_SENSITIVE_DATA".  We only need to
-    // redact values if they are sensitive, and at the time of writing
-    // only variables with PASSWORD in their name match this criteria
-    let log_sensitive_data = !name.contains("PASSWORD") || should_log_sensitive_data();
-
-    match std::env::var(name) {
-        Ok(p) => Ok(Some(p.parse().map_err(|err| {
-            let mut message = format!("{err:#}");
-            if !log_sensitive_data {
-                message = message.replace(&p, "REDACTED");
-            }
-            anyhow::anyhow!("parsing ${name}: {message}")
-        })?)),
-        Err(std::env::VarError::NotPresent) => {
-            let secret_env_name = format!("{}_FILE", name);
-
-            match std::env::var(&secret_env_name) {
-                Ok(path) => {
-                    let content = std::fs::read_to_string(&path).with_context(|| {
-                        format!(
-                            "Reading secret for {name} from path defined in {secret_env_name}: {path}"
-                        )
-                    })?;
-
-                    let trimmed_content = content.trim_end();
-
-                    Ok(Some(trimmed_content.parse().map_err(|err| {
-                        let mut message = format!("{err:#}");
-                        if !log_sensitive_data {
-                            message = message.replace(trimmed_content, "REDACTED");
-                        }
-                        anyhow::anyhow!("parsing secret content for {name}: {message}")
-                    })?))
-                }
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(err) => anyhow::bail!("${secret_env_name} is invalid: {err:#}"),
-            }
-        }
-        Err(err) => anyhow::bail!("${name} is invalid: {err:#}"),
-    }
-}
 
 fn setup_logger() {
     fn resolve_timezone() -> chrono_tz::Tz {
@@ -120,8 +13,6 @@ fn setup_logger() {
     let utc_suffix = if tz == chrono_tz::UTC { "Z" } else { "" };
 
     env_logger::builder()
-        // A bit of boilerplate here to get timestamps printed in local time.
-        // <https://github.com/rust-cli/env_logger/issues/158>
         .format(move |buf, record| {
             use chrono::Utc;
             use std::io::Write;
@@ -136,7 +27,25 @@ fn setup_logger() {
             if let Some(path) = record.module_path() {
                 write!(buf, " {}", path)?;
             }
-            writeln!(buf, "] {}", record.args())
+            writeln!(buf, "] {}", record.args())?;
+
+            // Capture into the log streaming system
+            let level_str = format!("{}", record.level());
+            let target = record.module_path().unwrap_or("").to_string();
+            let message = format!("{}", record.args());
+            govee::service::log_capture::push_log(&level_str, &target, &message);
+
+            // Write to rotating log file
+            let file_line = format!(
+                "[{}{utc_suffix} {:<5} {}] {}",
+                chrono::Utc::now().with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S"),
+                record.level(),
+                target,
+                message
+            );
+            govee::service::file_logger::write_line(&file_line);
+
+            Ok(())
         })
         .filter_level(log::LevelFilter::Info)
         .parse_env("RUST_LOG")
@@ -150,8 +59,9 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Loading environment overrides from {path:?}");
     }
 
+    govee::service::file_logger::init();
     setup_logger();
 
-    let args = Args::parse();
+    let args = govee::Args::parse();
     args.run().await
 }

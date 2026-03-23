@@ -4,7 +4,9 @@ use crate::hass_mqtt::humidifier::DEVICE_CLASS_HUMIDITY;
 use crate::hass_mqtt::instance::{lookup_entity_device, publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceCapability;
 use crate::service::device::Device as ServiceDevice;
-use crate::service::hass::{availability_topic, topic_safe_id, topic_safe_string, HassClient};
+use crate::service::hass::{
+    availability_topic, device_availability_entries, topic_safe_id, topic_safe_string, HassClient,
+};
 use crate::service::quirks::HumidityUnits;
 use crate::service::state::StateHandle;
 use crate::temperature::{TemperatureUnits, TemperatureValue, DEVICE_CLASS_TEMPERATURE};
@@ -74,6 +76,8 @@ impl GlobalFixedDiagnostic {
             sensor: SensorConfig {
                 base: EntityConfig {
                     availability_topic: availability_topic(),
+                    availability: vec![],
+                    availability_mode: None,
                     name: Some(name),
                     entity_category: Some("diagnostic".to_string()),
                     origin: Origin::default(),
@@ -115,18 +119,29 @@ impl CapabilitySensor {
         let unit_of_measurement = match instance.instance.as_str() {
             "sensorTemperature" => Some(state.get_temperature_scale().await.unit_of_measurement()),
             "sensorHumidity" => Some("%"),
+            "electricCurrent" => Some("A"),
+            "electricPower" | "powerConsumption" => Some("W"),
+            "voltage" => Some("V"),
+            "energy" | "energyConsumption" => Some("kWh"),
             _ => None,
         };
 
         let device_class = match instance.instance.as_str() {
             "sensorTemperature" => Some(DEVICE_CLASS_TEMPERATURE),
             "sensorHumidity" => Some(DEVICE_CLASS_HUMIDITY),
+            "electricCurrent" => Some("current"),
+            "electricPower" | "powerConsumption" => Some("power"),
+            "voltage" => Some("voltage"),
+            "energy" | "energyConsumption" => Some("energy"),
             _ => None,
         };
 
         let state_class = match instance.instance.as_str() {
-            "sensorTemperature" => Some(StateClass::Measurement),
-            "sensorHumidity" => Some(StateClass::Measurement),
+            "sensorTemperature" | "sensorHumidity" => Some(StateClass::Measurement),
+            "electricCurrent" | "electricPower" | "powerConsumption" | "voltage" => {
+                Some(StateClass::Measurement)
+            }
+            "energy" | "energyConsumption" => Some(StateClass::TotalIncreasing),
             _ => None,
         };
 
@@ -134,15 +149,30 @@ impl CapabilitySensor {
             "sensorTemperature" => "Temperature".to_string(),
             "sensorHumidity" => "Humidity".to_string(),
             "online" => "Connected to Govee Cloud".to_string(),
-            _ => instance.instance.to_string(),
+            "electricCurrent" => "Current".to_string(),
+            "electricPower" | "powerConsumption" => "Power".to_string(),
+            "voltage" => "Voltage".to_string(),
+            "energy" | "energyConsumption" => "Energy".to_string(),
+            _ => crate::service::hass::camel_case_to_space_separated(&instance.instance),
         };
+
+        // Energy/power sensors are primary entities, not diagnostics
+        let entity_category = match instance.instance.as_str() {
+            "electricCurrent" | "electricPower" | "powerConsumption" | "voltage" | "energy"
+            | "energyConsumption" => None,
+            _ => Some("diagnostic".to_string()),
+        };
+
+        let (availability, availability_mode) = device_availability_entries(device);
 
         Ok(Self {
             sensor: SensorConfig {
                 base: EntityConfig {
-                    availability_topic: availability_topic(),
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: Some(name),
-                    entity_category: Some("diagnostic".to_string()),
+                    entity_category,
                     origin: Origin::default(),
                     device: Device::for_device(device),
                     unique_id: unique_id.clone(),
@@ -150,7 +180,7 @@ impl CapabilitySensor {
                     icon: None,
                 },
                 state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
-                state_class: state_class,
+                state_class,
                 unit_of_measurement,
                 json_attributes_topic: None,
             },
@@ -235,10 +265,14 @@ impl DeviceStatusDiagnostic {
     pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
         let unique_id = format!("sensor-{id}-gv2mqtt-status", id = topic_safe_id(device),);
 
+        let (availability, availability_mode) = device_availability_entries(device);
+
         Self {
             sensor: SensorConfig {
                 base: EntityConfig {
-                    availability_topic: availability_topic(),
+                    availability_topic: String::new(),
+                    availability,
+                    availability_mode,
                     name: Some("Status".to_string()),
                     entity_category: Some("diagnostic".to_string()),
                     origin: Origin::default(),
@@ -375,5 +409,57 @@ mod tests {
         );
         assert!(published[1].1.contains("\"overall\""));
         assert!(published[1].1.contains("\"LAN API\""));
+    }
+
+    #[tokio::test]
+    async fn capability_sensor_electric_power_has_correct_device_class_and_unit() {
+        use super::{CapabilitySensor, StateClass};
+        use crate::platform_api::{DeviceCapability, DeviceCapabilityKind};
+
+        let state = Arc::new(State::new());
+        {
+            let mut device = state.device_mut("H7142", "PP:QQ").await;
+            device.set_lan_device_status(DeviceStatus {
+                on: true,
+                brightness: 100,
+                color: DeviceColor { r: 0, g: 0, b: 0 },
+                color_temperature_kelvin: 0,
+            });
+        }
+
+        let device = state.device_by_id("PP:QQ").await.unwrap();
+        let cap = DeviceCapability {
+            kind: DeviceCapabilityKind::Property,
+            instance: "electricPower".into(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        };
+
+        let sensor = CapabilitySensor::new(&device, &state, &cap).await.unwrap();
+
+        // Verify device_class is "power"
+        assert_eq!(
+            sensor.sensor.base.device_class,
+            Some("power"),
+            "electricPower should have device_class 'power'"
+        );
+        // Verify unit is "W"
+        assert_eq!(
+            sensor.sensor.unit_of_measurement,
+            Some("W"),
+            "electricPower should have unit 'W'"
+        );
+        // Verify state_class is Measurement
+        assert_eq!(
+            sensor.sensor.state_class,
+            Some(StateClass::Measurement),
+            "electricPower should have state_class Measurement"
+        );
+        // Energy sensors should NOT be diagnostic
+        assert!(
+            sensor.sensor.base.entity_category.is_none(),
+            "electricPower should not be a diagnostic entity"
+        );
     }
 }

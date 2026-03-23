@@ -1,0 +1,64 @@
+####################################################################################################
+## Build from source — for local development and testing
+####################################################################################################
+FROM rust:1-bookworm AS builder
+
+# System deps for mosquitto-rs (libmosquitto-sys builds from C source)
+RUN apt-get update && apt-get install -y \
+    cmake \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cache dependencies: copy manifests first, build deps, then copy source
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
+# Create a .tag file so build.rs doesn't try to run git
+RUN echo "dev" > .tag
+RUN cargo build --release 2>/dev/null || true
+RUN rm -rf src
+
+# Now copy the real source and build
+COPY src/ src/
+COPY test-data/ test-data/
+COPY assets/ assets/
+RUN touch src/main.rs && cargo build --release
+
+####################################################################################################
+## Runtime
+####################################################################################################
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/govee /app/govee
+COPY AmazonRootCA1.pem /app/
+COPY assets /app/assets
+COPY scene-data /app/scene-data
+
+ENV \
+  RUST_BACKTRACE=full \
+  RUST_LOG=govee=info \
+  PATH=/app:$PATH \
+  XDG_CACHE_HOME=/data
+
+VOLUME /data
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --start-interval=3s \
+  CMD curl -sf http://localhost:8056/api/health || exit 1
+
+EXPOSE 8056
+
+CMD ["/app/govee", \
+  "serve", \
+  "--govee-iot-key=/data/iot.key", \
+  "--govee-iot-cert=/data/iot.cert", \
+  "--amazon-root-ca=/app/AmazonRootCA1.pem"]

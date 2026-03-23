@@ -35,9 +35,10 @@ COPY --from=builder /work/govee /app/govee
 COPY AmazonRootCA1.pem /app
 COPY --from=builder --chown=govee:govee /data /data
 COPY assets /app/assets
+COPY scene-data /app/scene-data
 
 USER govee:govee
-LABEL org.opencontainers.image.source="https://github.com/wez/govee2mqtt"
+LABEL org.opencontainers.image.source="https://github.com/sitapix/govee2mqtt"
 ENV \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH \

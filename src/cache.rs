@@ -10,8 +10,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub static CACHE: Lazy<ArcSwap<Cache>> =
-    Lazy::new(|| open_cache().expect("failed to initialize cache").into());
+pub static CACHE: Lazy<ArcSwap<Cache>> = Lazy::new(|| {
+    match open_cache() {
+        Ok(cache) => cache.into(),
+        Err(err) => {
+            log::error!("Failed to initialize cache: {err:#}. Using in-memory fallback.");
+            let conn = sqlite_cache::rusqlite::Connection::open_in_memory()
+                .expect("in-memory SQLite");
+            Arc::new(
+                Cache::new(
+                    CacheConfig {
+                        flush_gc_ratio: 1024,
+                        flush_interval: Duration::from_secs(900),
+                        max_ttl: None,
+                    },
+                    conn,
+                )
+                .expect("in-memory cache"),
+            )
+            .into()
+        }
+    }
+});
 
 fn cache_file_name() -> PathBuf {
     let cache_dir = std::env::var("GOVEE_CACHE_DIR")
@@ -25,10 +45,28 @@ fn cache_file_name() -> PathBuf {
 
 fn open_cache() -> anyhow::Result<Arc<Cache>> {
     let cache_file = cache_file_name();
-    let conn = sqlite_cache::rusqlite::Connection::open(&cache_file)
-        .expect(&format!("failed to open {cache_file:?}"));
+
+    match try_open_cache(&cache_file) {
+        Ok(cache) => Ok(cache),
+        Err(first_err) => {
+            // If the database is malformed, delete it and try again
+            log::error!(
+                "Cache database {} is corrupt: {first_err:#}. \
+                 Deleting and rebuilding.",
+                cache_file.display()
+            );
+            if let Err(rm_err) = std::fs::remove_file(&cache_file) {
+                log::warn!("Failed to remove corrupt cache file: {rm_err:#}");
+            }
+            try_open_cache(&cache_file).context("failed to open cache after rebuild")
+        }
+    }
+}
+
+fn try_open_cache(cache_file: &std::path::Path) -> anyhow::Result<Arc<Cache>> {
+    let conn = sqlite_cache::rusqlite::Connection::open(cache_file)
+        .with_context(|| format!("failed to open {cache_file:?}"))?;
     Ok(Arc::new(Cache::new(
-        // We have low cardinality and can be pretty relaxed
         CacheConfig {
             flush_gc_ratio: 1024,
             flush_interval: Duration::from_secs(900),

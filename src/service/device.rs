@@ -120,13 +120,14 @@ impl Device {
         }
     }
 
-    /// Returns the device name; either the name defined in the Govee App,
-    /// or, if we don't have the information for some reason, then we compute
-    /// a name from the SKU and the last couple of bytes from the device id,
-    /// similar to the device name that would show up in a BLE scan, or
-    /// the default name for the device if not otherwise configured in the
-    /// Govee App.
+    /// Returns the device name. Priority: user config override > Govee App name > computed name.
     pub fn name(&self) -> String {
+        if let Some(ovr) = crate::service::device_config::get_device_override(&self.id, &self.sku)
+        {
+            if let Some(name) = ovr.name {
+                return name;
+            }
+        }
         if let Some(name) = self.govee_name() {
             return name.to_string();
         }
@@ -141,9 +142,15 @@ impl Device {
         None
     }
 
-    pub fn room_name(&self) -> Option<&str> {
+    pub fn room_name(&self) -> Option<String> {
+        if let Some(ovr) = crate::service::device_config::get_device_override(&self.id, &self.sku)
+        {
+            if let Some(room) = ovr.room {
+                return Some(room);
+            }
+        }
         if let Some(info) = &self.undoc_device_info {
-            return info.room_name.as_deref();
+            return info.room_name.clone();
         }
         None
     }
@@ -528,6 +535,13 @@ impl Device {
     }
 
     pub fn avoid_platform_api(&self) -> bool {
+        if let Some(ovr) = crate::service::device_config::get_device_override(&self.id, &self.sku)
+        {
+            if ovr.prefer_lan == Some(true) && self.lan_device.is_some() {
+                return true;
+            }
+        }
+
         if let Some(quirk) = self.resolve_quirk() {
             if quirk.avoid_platform_api {
                 return true;
@@ -603,6 +617,14 @@ impl Device {
     }
 
     pub fn get_color_temperature_range(&self) -> Option<(u32, u32)> {
+        // User config override takes highest priority
+        if let Some(ovr) = crate::service::device_config::get_device_override(&self.id, &self.sku)
+        {
+            if let Some(range) = ovr.color_temp_range {
+                return Some(range);
+            }
+        }
+
         if let Some(quirk) = self.resolve_quirk() {
             return quirk.color_temp_range;
         }

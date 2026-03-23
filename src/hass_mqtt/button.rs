@@ -3,7 +3,8 @@ use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceCapability;
 use crate::service::device::Device as ServiceDevice;
 use crate::service::hass::{
-    availability_topic, camel_case_to_space_separated, topic_safe_id, topic_safe_string, HassClient,
+    availability_topic, camel_case_to_space_separated, device_availability_entries, topic_safe_id,
+    topic_safe_string, HassClient,
 };
 use crate::service::state::StateHandle;
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ impl ButtonConfig {
             id = topic_safe_id(device),
             inst = instance.instance
         );
-        let availability_topic = availability_topic();
+        let (availability, availability_mode) = device_availability_entries(device);
         let unique_id = format!(
             "gv2mqtt-{id}-{inst}",
             id = topic_safe_id(device),
@@ -39,7 +40,9 @@ impl ButtonConfig {
 
         Ok(Self {
             base: EntityConfig {
-                availability_topic,
+                availability_topic: String::new(),
+                availability,
+                availability_mode,
                 name: Some(camel_case_to_space_separated(&instance.instance)),
                 device_class: None,
                 origin: Origin::default(),
@@ -59,6 +62,8 @@ impl ButtonConfig {
         Self {
             base: EntityConfig {
                 availability_topic: availability_topic(),
+                availability: vec![],
+                availability_mode: None,
                 name: Some(name.to_string()),
                 entity_category: None,
                 origin: Origin::default(),
@@ -89,9 +94,12 @@ impl ButtonConfig {
             id = topic_safe_id(device),
             mode = topic_safe_string(mode_name),
         );
+        let (availability, availability_mode) = device_availability_entries(device);
         Self {
             base: EntityConfig {
-                availability_topic: availability_topic(),
+                availability_topic: String::new(),
+                availability,
+                availability_mode,
                 name: Some(name.to_string()),
                 entity_category: None,
                 origin: Origin::default(),
@@ -114,9 +122,12 @@ impl ButtonConfig {
             "gv2mqtt/{id}/request-platform-data",
             id = topic_safe_id(device)
         );
+        let (availability, availability_mode) = device_availability_entries(device);
         Self {
             base: EntityConfig {
-                availability_topic: availability_topic(),
+                availability_topic: String::new(),
+                availability,
+                availability_mode,
                 name: Some("Request Platform API State".to_string()),
                 entity_category: Some("diagnostic".to_string()),
                 origin: Origin::default(),

@@ -15,7 +15,6 @@ use std::time::Instant;
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, Semaphore};
 use tokio::time::{sleep, Duration};
 
-#[derive(Default)]
 pub struct State {
     devices_by_id: Mutex<HashMap<String, Device>>,
     semaphore_by_id: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -26,6 +25,29 @@ pub struct State {
     hass_client: Mutex<Option<HassClient>>,
     hass_discovery_prefix: Mutex<String>,
     temperature_scale: Mutex<TemperatureScale>,
+    pub event_bus: crate::service::event_bus::EventBus,
+    /// Govee official MQTT push stats
+    pub push_connected: std::sync::atomic::AtomicBool,
+    pub push_event_count: std::sync::atomic::AtomicU64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            devices_by_id: Default::default(),
+            semaphore_by_id: Default::default(),
+            lan_client: Default::default(),
+            platform_client: Default::default(),
+            undoc_client: Default::default(),
+            iot_client: Default::default(),
+            hass_client: Default::default(),
+            hass_discovery_prefix: Default::default(),
+            temperature_scale: Default::default(),
+            event_bus: crate::service::event_bus::EventBus::new(),
+            push_connected: std::sync::atomic::AtomicBool::new(false),
+            push_event_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 pub type StateHandle = Arc<State>;
@@ -181,7 +203,6 @@ impl State {
         self.undoc_client.lock().await.replace(client);
     }
 
-    #[allow(dead_code)]
     pub async fn get_undoc_client(&self) -> Option<GoveeUndocumentedApi> {
         self.undoc_client.lock().await.clone()
     }
@@ -620,9 +641,24 @@ impl State {
             }
         }
 
-        let scenes = merge_scene_name_sources(platform_scenes, undoc_scenes);
+        let mut scenes = merge_scene_name_sources(platform_scenes, undoc_scenes);
+
+        // Merge decoded scene database (AlgoClaw) as additional source
+        let decoded_names =
+            crate::service::scene_database::scene_names_for_sku(&device.sku);
+        if !decoded_names.is_empty() {
+            let existing_lower: std::collections::HashSet<String> =
+                scenes.iter().map(|s| s.to_ascii_lowercase()).collect();
+            for name in decoded_names {
+                if !existing_lower.contains(&name.to_ascii_lowercase()) {
+                    scenes.push(name);
+                }
+            }
+            scenes = sort_and_dedup_scenes(scenes);
+        }
+
         if scenes.is_empty() {
-            log::trace!("No scene data available for {device} from Platform or undocumented APIs");
+            log::trace!("No scene data available for {device} from any source");
         }
 
         Ok(scenes)
@@ -729,13 +765,47 @@ impl State {
         }
 
         if let Some(lan_dev) = &device.lan_device {
-            log::info!("Using LAN API to set {device} to scene {scene}");
-            lan_dev.set_scene_by_name(scene).await?;
+            // Try undocumented scene catalog first
+            if let Ok(()) = lan_dev.set_scene_by_name(scene).await {
+                log::info!("Using LAN API (undoc catalog) to set {device} to scene {scene}");
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(Some(scene));
+                return Ok(());
+            }
 
-            self.device_mut(&device.sku, &device.id)
-                .await
-                .set_active_scene(Some(scene));
-            return Ok(());
+            // Fall back to decoded scene database (AlgoClaw ptReal commands)
+            if let Some(commands) =
+                crate::service::scene_database::scene_commands(&device.sku, scene)
+            {
+                log::info!(
+                    "Using LAN API (decoded database) to set {device} to scene {scene} ({} commands)",
+                    commands.len()
+                );
+                lan_dev.send_real(commands).await?;
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(Some(scene));
+                return Ok(());
+            }
+        }
+
+        // Also try decoded database via IoT if no LAN
+        if let Some(commands) =
+            crate::service::scene_database::scene_commands(&device.sku, scene)
+        {
+            if let Some(iot) = self.get_iot_client().await {
+                if let Some(info) = &device.undoc_device_info {
+                    log::info!(
+                        "Using IoT API (decoded database) to set {device} to scene {scene}"
+                    );
+                    iot.send_real(&info.entry, commands).await?;
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene(Some(scene));
+                    return Ok(());
+                }
+            }
         }
 
         anyhow::bail!("Unable to set scene for {device}");
@@ -747,12 +817,28 @@ impl State {
         instance: &str,
         option: &str,
     ) -> anyhow::Result<()> {
-        if let Some(client) = self.get_platform_client().await {
-            if let Some(info) = &device.http_device_info {
-                log::info!("Using Platform API to set {device} {instance} to {option}");
-                client
-                    .set_capability_by_name(info, instance, option)
-                    .await?;
+        let avoid_platform_api = device.avoid_platform_api();
+
+        if !avoid_platform_api {
+            if let Some(client) = self.get_platform_client().await {
+                if let Some(info) = &device.http_device_info {
+                    log::info!("Using Platform API to set {device} {instance} to {option}");
+                    client
+                        .set_capability_by_name(info, instance, option)
+                        .await?;
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene_for_instance(Some(instance), Some(option));
+                    return Ok(());
+                }
+            }
+        }
+
+        // LAN fallback for scene-type capabilities
+        if instance == "lightScene" {
+            if let Some(lan_dev) = &device.lan_device {
+                log::info!("Using LAN API to set {device} {instance} to {option}");
+                lan_dev.set_scene_by_name(option).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .set_active_scene_for_instance(Some(instance), Some(option));
@@ -870,13 +956,56 @@ impl State {
             anyhow::bail!("cannot find device {device_id}!?");
         };
 
+        // Emit event for any interested extensions
+        self.event_bus.emit(crate::service::event_bus::Event::DeviceStateChanged {
+            device_id: device_id.to_string(),
+        });
+
         if let Some(hass) = self.get_hass_client().await {
+            // Mark device as online since we just got a state update
+            let avail_topic =
+                crate::service::hass::device_availability_topic(&canonical_device);
+            if let Err(err) = hass.publish_retained(&avail_topic, "online").await {
+                log::warn!("Failed to publish device availability for {device_id}: {err:#}");
+            }
+
             hass.advise_hass_of_light_state(&canonical_device, self)
                 .await?;
         }
 
         Ok(())
     }
+
+    /// Publish bridge-level "offline" status and disconnect cleanly.
+    /// Per-device availability is handled by AvailabilityExtension::stop().
+    pub async fn graceful_shutdown(self: &Arc<Self>) {
+        log::info!("Graceful shutdown: publishing offline status");
+
+        if let Some(hass) = self.get_hass_client().await {
+            // Mark global bridge as offline
+            if let Err(err) = hass
+                .publish_retained(crate::service::hass::availability_topic(), "offline")
+                .await
+            {
+                log::warn!("Failed to publish bridge offline: {err:#}");
+            }
+
+            // Publish bridge info with offline state
+            let bridge_info = serde_json::json!({
+                "version": crate::version_info::govee_version(),
+                "state": "offline",
+            });
+            let _ = hass
+                .publish_retained("gv2mqtt/bridge/info", bridge_info.to_string())
+                .await;
+
+            // Give MQTT time to flush
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        log::info!("Graceful shutdown complete");
+    }
+
 }
 
 pub fn sort_and_dedup_scenes(scenes: Vec<String>) -> Vec<String> {

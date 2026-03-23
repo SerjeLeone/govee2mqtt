@@ -89,7 +89,21 @@ configuration:
       global broadcast address 255.255.255.255. To be honest, if
       multicast-UDP doesn't work, this isn't likely to work any
       better.
-
+  disable_effects:
+    name: Disable Effects
+    description: >-
+      When enabled, no effects/scenes are published in the MQTT
+      discovery config for lights. This fixes Google Home showing
+      devices as offline due to oversized SYNC payloads when a
+      device has many effects. Scene control via automations or
+      the Govee app still works.
+  allowed_effects:
+    name: Allowed Effects
+    description: >-
+      Comma-separated list of effect names to publish in MQTT
+      discovery. Only matching effects are included
+      (case-insensitive). Leave blank for all effects. Ignored
+      when Disable Effects is enabled.
 
 
 

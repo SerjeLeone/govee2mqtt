@@ -1,8 +1,10 @@
 FROM debian:bookworm-slim
 
+ARG TARGETPLATFORM=linux/amd64
+
 WORKDIR /app
 
-COPY docker-target/linux/arm64/govee /app/govee
+COPY docker-target/${TARGETPLATFORM}/govee /app/govee
 COPY AmazonRootCA1.pem /app/
 COPY assets /app/assets
 

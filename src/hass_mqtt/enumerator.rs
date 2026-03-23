@@ -35,6 +35,17 @@ pub async fn enumerate_all_entites(state: &StateHandle) -> anyhow::Result<Entity
             .with_context(|| format!("Config::for_device({d})"))?;
     }
 
+    // Enumerate device groups from config
+    for (group_id, group) in crate::service::device_config::get_groups() {
+        if group.members.is_empty() {
+            log::warn!("Group '{group_id}' has no members, skipping");
+            continue;
+        }
+        entities.add(crate::hass_mqtt::group_light::GroupLight::new(
+            &group_id, &group, state,
+        ));
+    }
+
     Ok(entities)
 }
 
@@ -59,6 +70,8 @@ async fn enumerate_scenes(state: &StateHandle, entities: &mut EntityList) -> any
                     entities.add(SceneConfig {
                         base: EntityConfig {
                             availability_topic: availability_topic(),
+                            availability: vec![],
+                            availability_mode: None,
                             name: Some(oc.name.to_string()),
                             entity_category: None,
                             origin: Origin::default(),
@@ -160,6 +173,13 @@ pub async fn enumerate_entities_for_device<'a>(
 
     if d.supports_rgb() || d.get_color_temperature_range().is_some() || d.supports_brightness() {
         entities.add(DeviceLight::for_device(&d, state, None).await?);
+    } else if let DeviceType::Other(ref other) = d.device_type() {
+        log::info!(
+            "Device {d} has unknown type '{other}'. \
+             Exposing available capabilities (switches, sensors). \
+             Use /api/device/{id}/inspect to see full device data.",
+            id = crate::service::hass::topic_safe_id(d),
+        );
     }
 
     if matches!(
@@ -218,15 +238,24 @@ pub async fn enumerate_entities_for_device<'a>(
                 }
 
                 kind => {
-                    log::warn!(
-                        "Do something about {kind:?} {} for {d} {cap:?}",
-                        cap.instance
+                    log::info!(
+                        "Unhandled capability {kind:?} '{instance}' for {d}. \
+                         If you need this capability, please open an issue with \
+                         the output of /api/device/{id}/inspect",
+                        instance = cap.instance,
+                        id = crate::service::hass::topic_safe_id(d),
                     );
                 }
             }
         }
 
-        if let Some(segments) = info.supports_segmented_rgb() {
+        let segments = info.supports_segmented_rgb().or_else(|| {
+            // Fall back to quirk-defined segment count when API doesn't report it
+            d.resolve_quirk()
+                .and_then(|q| q.segment_count)
+                .map(|count| 0..count)
+        });
+        if let Some(segments) = segments {
             for n in segments {
                 entities.add(DeviceLight::for_device(&d, state, Some(n)).await?);
             }

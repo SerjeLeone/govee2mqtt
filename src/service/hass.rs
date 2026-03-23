@@ -64,7 +64,7 @@ pub struct HassArguments {
     /// The temperature scale to use when showing temperature values as
     /// entities in home assistant. Can be either "C" or "F" for Celsius
     /// or Fahrenheit respectively.
-    /// You may also set this vai the GOVEE_TEMPERATURE_SCALE environment
+    /// You may also set this via the GOVEE_TEMPERATURE_SCALE environment
     /// variable.
     #[arg(long, global = true)]
     temperature_scale: Option<String>,
@@ -155,6 +155,12 @@ impl HassClient {
         }
     }
 
+    /// Re-register all entities with Home Assistant.
+    /// Call after config changes to update names, icons, availability, etc.
+    pub async fn re_register(&self, state: &StateHandle) -> anyhow::Result<()> {
+        self.register_with_hass(state).await
+    }
+
     async fn register_with_hass(&self, state: &StateHandle) -> anyhow::Result<()> {
         let entities = enumerate_all_entites(state).await?;
         self.clear_recorded_config_topics();
@@ -175,9 +181,18 @@ impl HassClient {
 
         // Mark as available
         log::trace!("register_with_hass: mark as online");
-        self.publish(availability_topic(), "online")
+        self.publish_retained(availability_topic(), "online")
             .await
             .context("online -> availability_topic")?;
+
+        // Publish bridge info
+        let bridge_info = serde_json::json!({
+            "version": crate::version_info::govee_version(),
+            "state": "online",
+        });
+        self.publish_retained("gv2mqtt/bridge/info", bridge_info.to_string())
+            .await
+            .context("publish bridge info")?;
 
         // report initial state
         log::trace!("register_with_hass: reporting state");
@@ -292,7 +307,7 @@ impl HassClient {
         topic: T,
         payload: P,
     ) -> anyhow::Result<()> {
-        self.publish_with_options(topic, payload, false).await
+        self.publish_with_options(topic, payload, true).await
     }
 
     pub async fn publish_retained<
@@ -322,7 +337,7 @@ impl HassClient {
         match &self.backend {
             HassClientBackend::Mqtt(client) => {
                 client
-                    .publish(&topic, payload_string.as_bytes(), QoS::AtMostOnce, retain)
+                    .publish(&topic, payload_string.as_bytes(), QoS::AtLeastOnce, retain)
                     .await?;
             }
             #[cfg(test)]
@@ -338,7 +353,7 @@ impl HassClient {
         topic: T,
         payload: P,
     ) -> anyhow::Result<()> {
-        self.publish_obj_with_options(topic, payload, false).await
+        self.publish_obj_with_options(topic, payload, true).await
     }
 
     pub async fn publish_obj_retained<T: AsRef<str> + std::fmt::Display, P: Serialize>(
@@ -362,7 +377,7 @@ impl HassClient {
         match &self.backend {
             HassClientBackend::Mqtt(client) => {
                 client
-                    .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, retain)
+                    .publish(&topic, payload.as_bytes(), QoS::AtLeastOnce, retain)
                     .await?;
             }
             #[cfg(test)]
@@ -425,7 +440,11 @@ pub fn topic_safe_string(s: &str) -> String {
 }
 
 pub fn topic_safe_id(device: &ServiceDevice) -> String {
-    let mut id = device.id.to_string();
+    topic_safe_id_str(&device.id)
+}
+
+pub fn topic_safe_id_str(id: &str) -> String {
+    let mut id = id.to_string();
     id.retain(|c| c != ':');
     id.retain(|c| c != ' ');
     id
@@ -449,10 +468,34 @@ pub fn light_segment_state_topic(device: &ServiceDevice, segment: u32) -> String
     )
 }
 
-/// All entities use the same topic so that we can mark unavailable
-/// via last-will
+/// Global bridge availability topic, used as last-will
 pub fn availability_topic() -> String {
     "gv2mqtt/availability".to_string()
+}
+
+/// Per-device availability topic
+pub fn device_availability_topic(device: &ServiceDevice) -> String {
+    format!("gv2mqtt/{}/availability", topic_safe_id(device))
+}
+
+/// Build availability entries for a device-bound entity.
+/// Includes both the global bridge topic and the per-device topic.
+/// Entity is available only when both the bridge AND the device are online.
+pub fn device_availability_entries(
+    device: &ServiceDevice,
+) -> (Vec<crate::hass_mqtt::base::AvailabilityEntry>, Option<String>) {
+    use crate::hass_mqtt::base::AvailabilityEntry;
+    (
+        vec![
+            AvailabilityEntry {
+                topic: availability_topic(),
+            },
+            AvailabilityEntry {
+                topic: device_availability_topic(device),
+            },
+        ],
+        Some("all".to_string()),
+    )
 }
 
 pub fn oneclick_topic() -> String {
@@ -491,6 +534,70 @@ struct HassLightCommand {
 }
 
 /// HASS is sending a command to a light
+async fn mqtt_group_light_command(
+    Payload(payload): Payload<String>,
+    Params(IdParameter { id }): Params<IdParameter>,
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    log::info!("Group command for {id}: {payload}");
+
+    // Find the group members from config
+    let groups = crate::service::device_config::get_groups();
+    let group = groups
+        .iter()
+        .find(|(gid, _)| gid.replace(' ', "_").to_ascii_lowercase() == id.to_ascii_lowercase())
+        .map(|(_, g)| g)
+        .ok_or_else(|| anyhow::anyhow!("group '{id}' not found"))?;
+
+    // Fan out the command to all member devices in parallel
+    let mut handles = vec![];
+    for member_id in &group.members {
+        let state = state.clone();
+        let member_id = member_id.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            match state.resolve_device_for_control(&member_id).await {
+                Ok(device) => {
+                    // Re-parse command for each device and apply
+                    let command: HassLightCommand = match serde_json::from_str(&payload) {
+                        Ok(cmd) => cmd,
+                        Err(err) => {
+                            log::warn!("Failed to parse group command for {member_id}: {err:#}");
+                            return;
+                        }
+                    };
+
+                    if command.state == "OFF" {
+                        let _ = state.device_light_power_on(&device, false).await;
+                    } else {
+                        if let Some(brightness) = command.brightness {
+                            let _ = state.device_set_brightness(&device, brightness).await;
+                        }
+                        if let Some(color) = &command.color {
+                            let _ = state
+                                .device_set_color_rgb(&device, color.r, color.g, color.b)
+                                .await;
+                        }
+                        if let Some(kelvin) = command.color_temp {
+                            let _ = state.device_set_color_temperature(&device, kelvin).await;
+                        }
+                        let _ = state.device_light_power_on(&device, true).await;
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Group member {member_id} not found: {err:#}");
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    Ok(())
+}
+
 async fn mqtt_light_command(
     Payload(payload): Payload<String>,
     Params(IdParameter { id }): Params<IdParameter>,
@@ -619,8 +726,22 @@ async fn mqtt_light_segment_command(
                 .set_segment_rgb(&info, segment, color.r, color.g, color.b)
                 .await?;
         }
+    } else if let Some(lan_dev) = &device.lan_device {
+        // LAN fallback for segment control via ptReal binary protocol
+        log::info!("Using LAN API to control {device} segment {segment}");
+        if command.state == "OFF" {
+            // Turn off segment by setting it to black via LAN ptReal
+            lan_dev
+                .send_segment_color_rgb(segment, 0, 0, 0)
+                .await?;
+        }
+        if let Some(color) = &command.color {
+            lan_dev
+                .send_segment_color_rgb(segment, color.r, color.g, color.b)
+                .await?;
+        }
     } else {
-        anyhow::bail!("set segments for {device}: Platform API is not available");
+        anyhow::bail!("set segments for {device}: no API available for segment control");
     }
 
     Ok(())
@@ -638,28 +759,174 @@ async fn mqtt_purge_caches(State(state): State<StateHandle>) -> anyhow::Result<(
         .context("register_with_hass")
 }
 
+async fn mqtt_bridge_request_health(State(state): State<StateHandle>) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: health");
+    crate::service::ext_health::publish_bridge_health(&state).await;
+    Ok(())
+}
+
+async fn mqtt_bridge_request_restart(State(_state): State<StateHandle>) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: restart");
+    // Publish response before exiting
+    if let Some(hass) = _state.get_hass_client().await {
+        let _ = hass
+            .publish_retained(
+                "gv2mqtt/bridge/response/restart",
+                r#"{"status":"ok"}"#,
+            )
+            .await;
+    }
+    // Give MQTT time to publish the response
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    std::process::exit(1);
+}
+
+async fn mqtt_bridge_request_devices(State(state): State<StateHandle>) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: devices");
+    crate::service::ext_health::publish_bridge_devices(&state).await;
+    Ok(())
+}
+
+async fn mqtt_bridge_request_config_reload(
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: config_reload");
+    crate::service::device_config::load_device_config();
+    if let Some(hass) = state.get_hass_client().await {
+        let _ = hass
+            .publish_retained(
+                "gv2mqtt/bridge/response/config_reload",
+                r#"{"status":"ok"}"#,
+            )
+            .await;
+        hass.re_register(&state).await?;
+    }
+    Ok(())
+}
+
+async fn mqtt_bridge_request_log_level(
+    Payload(level): Payload<String>,
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: log_level -> {level}");
+    // Update the log filter at runtime
+    log::set_max_level(
+        level
+            .parse()
+            .unwrap_or(log::LevelFilter::Info),
+    );
+    if let Some(hass) = state.get_hass_client().await {
+        let _ = hass
+            .publish_retained(
+                "gv2mqtt/bridge/response/log_level",
+                &format!(r#"{{"status":"ok","level":"{level}"}}"#),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+async fn mqtt_bridge_request_cache_purge(
+    State(state): State<StateHandle>,
+) -> anyhow::Result<()> {
+    log::info!("mqtt bridge request: cache_purge");
+    crate::cache::purge_cache()?;
+    if let Some(hass) = state.get_hass_client().await {
+        let _ = hass
+            .publish_retained(
+                "gv2mqtt/bridge/response/cache_purge",
+                r#"{"status":"ok"}"#,
+            )
+            .await;
+    }
+    state
+        .get_hass_client()
+        .await
+        .expect("have hass client")
+        .register_with_hass(&state)
+        .await
+        .context("register_with_hass after cache purge")
+}
+
 async fn mqtt_oneclick(
     Payload(name): Payload<String>,
     State(state): State<StateHandle>,
 ) -> anyhow::Result<()> {
     log::info!("mqtt_oneclick: {name}");
 
-    let undoc = state
-        .get_undoc_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Undoc API client is not available"))?;
-    let items = undoc.parse_one_clicks().await?;
-    let item = items
-        .iter()
-        .find(|item| item.name == name)
-        .ok_or_else(|| anyhow::anyhow!("didn't find item {name}"))?;
+    let undoc = match state.get_undoc_client().await {
+        Some(client) => client,
+        None => {
+            let msg = "One-click failed: Undoc API client is not available. \
+                       Configure govee_email and govee_password to enable one-click scenes.";
+            log::error!("{msg}");
+            if let Some(hass) = state.get_hass_client().await {
+                let _ = hass
+                    .publish("gv2mqtt/bridge/error", msg)
+                    .await;
+            }
+            anyhow::bail!("{msg}");
+        }
+    };
 
-    let iot = state
-        .get_iot_client()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("AWS IoT client is not available"))?;
+    let items = match undoc.parse_one_clicks().await {
+        Ok(items) => items,
+        Err(err) => {
+            let msg = format!(
+                "One-click '{name}' failed: could not fetch one-click list: {err:#}. \
+                 This may be a rate limit or network issue."
+            );
+            log::error!("{msg}");
+            if let Some(hass) = state.get_hass_client().await {
+                let _ = hass.publish("gv2mqtt/bridge/error", &msg).await;
+            }
+            anyhow::bail!("{msg}");
+        }
+    };
 
-    iot.activate_one_click(&item).await
+    let item = match items.iter().find(|item| item.name == name) {
+        Some(item) => item,
+        None => {
+            let available: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+            let msg = format!(
+                "One-click '{name}' not found. Available: {available:?}. \
+                 Try purging caches if you recently created this scene in the Govee app."
+            );
+            log::error!("{msg}");
+            if let Some(hass) = state.get_hass_client().await {
+                let _ = hass.publish("gv2mqtt/bridge/error", &msg).await;
+            }
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    let iot = match state.get_iot_client().await {
+        Some(client) => client,
+        None => {
+            let msg = "One-click failed: AWS IoT client is not connected. \
+                       One-click scenes require the IoT connection (govee_email + govee_password).";
+            log::error!("{msg}");
+            if let Some(hass) = state.get_hass_client().await {
+                let _ = hass.publish("gv2mqtt/bridge/error", msg).await;
+            }
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    match iot.activate_one_click(&item).await {
+        Ok(()) => {
+            log::info!("One-click '{name}' activated successfully");
+            Ok(())
+        }
+        Err(err) => {
+            let msg = format!("One-click '{name}' failed to activate: {err:#}");
+            log::error!("{msg}");
+            if let Some(hass) = state.get_hass_client().await {
+                let _ = hass.publish("gv2mqtt/bridge/error", &msg).await;
+            }
+            Err(err)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -755,6 +1022,9 @@ async fn run_mqtt_loop(
             .route("gv2mqtt/light/:id/command", mqtt_light_command)
             .await?;
         router
+            .route("gv2mqtt/group/:id/command", mqtt_group_light_command)
+            .await?;
+        router
             .route(
                 "gv2mqtt/light/:id/command/:segment",
                 mqtt_light_segment_command,
@@ -766,6 +1036,42 @@ async fn run_mqtt_loop(
 
         router.route(oneclick_topic(), mqtt_oneclick).await?;
         router.route(purge_cache_topic(), mqtt_purge_caches).await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/health",
+                mqtt_bridge_request_health,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/restart",
+                mqtt_bridge_request_restart,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/cache_purge",
+                mqtt_bridge_request_cache_purge,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/devices",
+                mqtt_bridge_request_devices,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/config_reload",
+                mqtt_bridge_request_config_reload,
+            )
+            .await?;
+        router
+            .route(
+                "gv2mqtt/bridge/request/log_level",
+                mqtt_bridge_request_log_level,
+            )
+            .await?;
         router
             .route(
                 "gv2mqtt/:id/request-platform-data",
@@ -881,7 +1187,7 @@ pub async fn spawn_hass_integration(
     let mqtt_password = args.mqtt_password()?;
     let mqtt_port = args.mqtt_port()?;
 
-    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, false)?;
+    client.set_last_will(availability_topic(), "offline", QoS::AtLeastOnce, true)?;
 
     if mqtt_username.is_some() != mqtt_password.is_some() {
         log::error!(

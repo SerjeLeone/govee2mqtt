@@ -4,7 +4,7 @@
       <meta charset="UTF-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <base href="__BASE_HREF__" />
-      <title>Govee Controller</title>
+      <title>Govee to MQTT</title>
       <link rel="icon" href="assets/favicon.ico" type="image/x-icon" />
       <link
         href="assets/bootstrap.min.css"
@@ -29,18 +29,60 @@
 
     <script type="module" src="assets/color-modes.js"></script>
     <script type="module" src="assets/components/devices.js"></script>
+    <script type="module" src="assets/components/logs.js"></script>
+    <script type="module" src="assets/components/bridge-info.js"></script>
+    <script type="module" src="assets/components/config-editor.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/timeago.js@4.0.2/dist/timeago.min.js"></script>
   </head>
   <body>
-    <main class="container p-5">
-
-      <div class="bg-body-tertiary p-5 rounded">
-
-      <gv-device-list></gv-device-list>
-
+    <nav class="navbar navbar-expand-sm bg-body-tertiary border-bottom">
+      <div class="container-fluid">
+        <a class="navbar-brand" href="#">
+          <strong>Govee</strong><span class="text-muted fw-normal">2MQTT</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+                data-bs-target="#navContent">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navContent">
+          <ul class="navbar-nav" id="main-nav">
+            <li class="nav-item">
+              <a class="nav-link active" href="#" data-tab="devices">Devices</a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#" data-tab="logs">Logs</a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#" data-tab="bridge">Bridge</a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#" data-tab="settings">Settings</a>
+            </li>
+          </ul>
+          <div class="d-flex align-items-center ms-auto gap-2">
+            <span class="navbar-text d-none d-md-inline" id="nav-status"></span>
+            <button class="btn btn-sm btn-outline-secondary" id="theme-toggle" title="Toggle theme"></button>
+          </div>
+        </div>
       </div>
+    </nav>
 
+    <main class="container-fluid py-3 px-md-4">
+      <div id="tab-devices">
+        <gv-device-list></gv-device-list>
+      </div>
+      <div id="tab-logs" style="display:none">
+        <gv-log-viewer></gv-log-viewer>
+      </div>
+      <div id="tab-bridge" style="display:none">
+        <gv-bridge-info></gv-bridge-info>
+      </div>
+      <div id="tab-settings" style="display:none">
+        <gv-config-editor></gv-config-editor>
+      </div>
     </main>
+
+    <div class="gv-toast-container" id="toast-container"></div>
 
     <script
       src="assets/popper.min.js"
@@ -51,5 +93,57 @@
       src="assets/bootstrap.bundle.min.js"
       integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL"
       crossorigin="anonymous"></script>
+
+    <script>
+      // Tab routing
+      document.getElementById('main-nav').addEventListener('click', (e) => {
+        if (e.target.dataset.tab) {
+          e.preventDefault();
+          document.querySelectorAll('[id^="tab-"]').forEach(el => el.style.display = 'none');
+          document.querySelectorAll('#main-nav .nav-link').forEach(el => el.classList.remove('active'));
+          document.getElementById('tab-' + e.target.dataset.tab).style.display = '';
+          e.target.classList.add('active');
+        }
+      });
+
+      // Toast notification system
+      window.gvToast = function(message, type = 'info') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `gv-toast ${type}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+      };
+
+      // Theme toggle
+      const themeBtn = document.getElementById('theme-toggle');
+      function updateThemeButton() {
+        const theme = document.documentElement.getAttribute('data-bs-theme');
+        themeBtn.textContent = theme === 'dark' ? 'Light' : 'Dark';
+      }
+      themeBtn.addEventListener('click', () => {
+        const current = document.documentElement.getAttribute('data-bs-theme');
+        const next = current === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-bs-theme', next);
+        localStorage.setItem('theme', next);
+        updateThemeButton();
+      });
+      updateThemeButton();
+
+      // Navbar status badge
+      async function updateNavStatus() {
+        try {
+          const resp = await fetch('api/health');
+          if (resp.ok) {
+            const h = await resp.json();
+            document.getElementById('nav-status').innerHTML =
+              `<span class="badge bg-secondary">${h.devices} devices</span>`;
+          }
+        } catch(e) {}
+      }
+      updateNavStatus();
+      setInterval(updateNavStatus, 30000);
+    </script>
   </body>
 </html>

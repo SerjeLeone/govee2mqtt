@@ -38,6 +38,8 @@ pub struct Quirk {
     /// their state.
     pub iot_api_supported: bool,
     pub show_as_preset_buttons: Option<&'static [&'static str]>,
+    /// Number of controllable segments, if the Platform API doesn't report them.
+    pub segment_count: Option<u32>,
 }
 
 impl Quirk {
@@ -60,6 +62,7 @@ impl Quirk {
             platform_humidity_sensor_units: None,
             iot_api_supported: false,
             show_as_preset_buttons: None,
+            segment_count: None,
         }
     }
 
@@ -77,6 +80,10 @@ impl Quirk {
 
     pub fn space_heater<SKU: Into<Cow<'static, str>>>(sku: SKU) -> Self {
         Self::device(sku, DeviceType::Heater, "mdi:heat-wave")
+    }
+
+    pub fn fan<SKU: Into<Cow<'static, str>>>(sku: SKU) -> Self {
+        Self::device(sku, DeviceType::Fan, "mdi:fan")
     }
 
     pub fn humidifier<SKU: Into<Cow<'static, str>>>(sku: SKU) -> Self {
@@ -137,6 +144,11 @@ impl Quirk {
         self
     }
 
+    pub fn with_segment_count(mut self, count: u32) -> Self {
+        self.segment_count = Some(count);
+        self
+    }
+
     pub fn with_ble_only(mut self, ble_only: bool) -> Self {
         self.ble_only = ble_only;
         self
@@ -154,7 +166,108 @@ impl Quirk {
     }
 }
 
-static QUIRKS: Lazy<HashMap<String, Quirk>> = Lazy::new(load_quirks);
+static QUIRKS: Lazy<HashMap<String, Quirk>> = Lazy::new(|| {
+    let mut map = load_quirks();
+    load_external_quirks(&mut map);
+    map
+});
+
+/// A user-defined quirk loaded from JSON.
+#[derive(serde::Deserialize, Debug)]
+struct ExternalQuirk {
+    pub sku: String,
+    #[serde(default = "default_icon")]
+    pub icon: String,
+    #[serde(default)]
+    pub supports_rgb: bool,
+    #[serde(default)]
+    pub supports_brightness: bool,
+    #[serde(default)]
+    pub color_temp_range: Option<(u32, u32)>,
+    #[serde(default)]
+    pub avoid_platform_api: bool,
+    #[serde(default)]
+    pub ble_only: bool,
+    #[serde(default)]
+    pub lan_api_capable: bool,
+    #[serde(default = "default_device_type")]
+    pub device_type: String,
+    #[serde(default)]
+    pub iot_api_supported: bool,
+}
+
+fn default_icon() -> String {
+    BULB.to_string()
+}
+fn default_device_type() -> String {
+    "light".to_string()
+}
+
+fn parse_device_type(s: &str) -> DeviceType {
+    match s.to_ascii_lowercase().as_str() {
+        "light" => DeviceType::Light,
+        "humidifier" => DeviceType::Humidifier,
+        "dehumidifier" => DeviceType::Dehumidifier,
+        "heater" => DeviceType::Heater,
+        "thermometer" => DeviceType::Thermometer,
+        "kettle" => DeviceType::Kettle,
+        "ice_maker" | "icemaker" => DeviceType::IceMaker,
+        other => DeviceType::Other(other.to_string()),
+    }
+}
+
+fn external_quirks_path() -> std::path::PathBuf {
+    let mut path = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push("govee-quirks.json");
+    path
+}
+
+fn load_external_quirks(map: &mut HashMap<String, Quirk>) {
+    let path = external_quirks_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let externals: Vec<ExternalQuirk> = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(err) => {
+            log::error!("Failed to parse external quirks {}: {err:#}", path.display());
+            return;
+        }
+    };
+
+    log::info!(
+        "Loaded {} external quirk(s) from {}",
+        externals.len(),
+        path.display()
+    );
+
+    for ext in externals {
+        let quirk = Quirk {
+            sku: Cow::Owned(ext.sku.clone()),
+            icon: Cow::Owned(ext.icon),
+            supports_rgb: ext.supports_rgb,
+            supports_brightness: ext.supports_brightness,
+            color_temp_range: ext.color_temp_range,
+            avoid_platform_api: ext.avoid_platform_api,
+            ble_only: ext.ble_only,
+            lan_api_capable: ext.lan_api_capable,
+            device_type: parse_device_type(&ext.device_type),
+            platform_temperature_sensor_units: None,
+            platform_humidity_sensor_units: None,
+            iot_api_supported: ext.iot_api_supported,
+            show_as_preset_buttons: None,
+            segment_count: None,
+        };
+        if map.contains_key(&ext.sku) {
+            log::info!("External quirk overrides built-in for SKU {}", ext.sku);
+        }
+        map.insert(ext.sku, quirk);
+    }
+}
 
 const STRIP: &str = "mdi:led-strip-variant";
 const STRIP_ALT: &str = "mdi:led-strip";
@@ -258,6 +371,8 @@ fn load_quirks() -> HashMap<String, Quirk> {
             .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
         // <https://github.com/wez/govee2mqtt/issues/343>
         Quirk::ice_maker("H7172").with_iot_api_support(false),
+        // Tower fan, IoT only (from 64bitjoe fork)
+        Quirk::fan("H7105").with_iot_api_support(true),
         Quirk::thermometer("H5051")
             .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit)
             .with_platform_humidity_sensor_units(HumidityUnits::RelativePercent),
@@ -299,6 +414,8 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H6076", FLOOR_LAMP),
         Quirk::lan_api_capable_light("H6078", FLOOR_LAMP),
         Quirk::lan_api_capable_light("H6087", WALL_SCONCE),
+        // Neon Rope Light 2, LAN-capable (from homeassilol fork)
+        Quirk::lan_api_capable_light("H60B0", STRIP),
         Quirk::lan_api_capable_light("H610A", STRIP),
         Quirk::lan_api_capable_light("H610B", STRIP),
         Quirk::lan_api_capable_light("H6117", STRIP),
@@ -329,8 +446,13 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H7028", STRING),
         Quirk::lan_api_capable_light("H7041", STRING),
         Quirk::lan_api_capable_light("H7042", STRING),
-        Quirk::lan_api_capable_light("H7050", BULB),
-        Quirk::lan_api_capable_light("H7051", BULB),
+        // Desk light, LAN-capable (from faxd fork)
+        Quirk::lan_api_capable_light("H8022", DESK),
+        // H7050/H7051 support segments in the Govee app but the Platform API
+        // doesn't report segmentedColorRgb. Segment count from user reports.
+        // <https://github.com/wez/govee2mqtt/issues/559>
+        Quirk::lan_api_capable_light("H7050", BULB).with_segment_count(15),
+        Quirk::lan_api_capable_light("H7051", BULB).with_segment_count(15),
         Quirk::lan_api_capable_light("H7052", STRING),
         Quirk::lan_api_capable_light("H7055", BULB),
         Quirk::lan_api_capable_light("H705A", OUTDOOR_LAMP),

@@ -51,6 +51,8 @@ mod tests {
         let scene = SceneConfig {
             base: EntityConfig {
                 availability_topic: availability_topic(),
+                availability: vec![],
+                availability_mode: None,
                 name: Some("Movie Time".to_string()),
                 device_class: None,
                 origin: Origin::default(),

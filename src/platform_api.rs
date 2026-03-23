@@ -23,6 +23,19 @@ const SERVER: &str = "https://openapi.api.govee.com";
 pub const ONE_WEEK: Duration = Duration::from_secs(86400 * 7);
 pub const FIVE_MINUTES: Duration = Duration::from_secs(5 * 60);
 
+/// Deserialize a bool from any JSON value: true/false, 0/1, "true"/"false",
+/// or any unexpected type (map, array) as true.
+/// Govee's API inconsistently returns `required` as a bool, map, or string.
+fn lenient_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let value: JsonValue = Deserialize::deserialize(deserializer)?;
+    Ok(match &value {
+        JsonValue::Bool(b) => *b,
+        JsonValue::Number(n) => n.as_i64().unwrap_or(0) != 0,
+        JsonValue::String(s) => matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"),
+        _ => true, // map, array, etc. — treat as required
+    })
+}
+
 fn endpoint(url: &str) -> String {
     format!("{SERVER}{url}")
 }
@@ -824,11 +837,31 @@ struct GetDevicesResponse {
 pub struct HttpDeviceInfo {
     pub sku: String,
     pub device: String,
-    #[serde(default, rename = "deviceName")]
+    #[serde(default, rename = "deviceName", deserialize_with = "deserialize_optional_localized_name")]
     pub device_name: String,
     #[serde(default, rename = "type")]
     pub device_type: DeviceType,
+    #[serde(deserialize_with = "deserialize_capabilities")]
     pub capabilities: Vec<DeviceCapability>,
+}
+
+/// Deserialize capabilities, skipping any individual capability that fails
+/// to parse. This prevents a single malformed capability from Govee's API
+/// from breaking the entire device.
+fn deserialize_capabilities<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<DeviceCapability>, D::Error> {
+    let raw: Vec<JsonValue> = Deserialize::deserialize(deserializer)?;
+    let mut result = Vec::with_capacity(raw.len());
+    for value in raw {
+        match serde_json::from_value::<DeviceCapability>(value.clone()) {
+            Ok(cap) => result.push(cap),
+            Err(err) => {
+                log::warn!("Skipping unparseable capability: {err}. Raw: {value}");
+            }
+        }
+    }
+    Ok(result)
 }
 
 impl HttpDeviceInfo {
@@ -1076,7 +1109,9 @@ pub struct StructField {
     #[serde(rename = "defaultValue")]
     pub default_value: Option<JsonValue>,
 
-    #[serde(default)]
+    /// Govee's API inconsistently returns this as bool, map, or string.
+    /// Accept any JSON value and coerce to bool.
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub required: bool,
 }
 
@@ -1104,11 +1139,49 @@ pub struct IntegerRange {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct EnumOption {
+    /// May be a plain string or a localized object like {"en": "Game", "de": "Spiel"}.
+    /// We extract the English name or fall back to the first available.
+    #[serde(deserialize_with = "deserialize_localized_name")]
     pub name: String,
     #[serde(default)]
     pub value: JsonValue,
     #[serde(flatten)]
     pub extras: HashMap<String, JsonValue>,
+}
+
+/// Deserialize an optional localized name. Returns empty string for null/missing.
+fn deserialize_optional_localized_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let value: JsonValue = Deserialize::deserialize(deserializer)?;
+    Ok(match &value {
+        JsonValue::Null => String::new(),
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Object(map) => map
+            .get("en")
+            .or_else(|| map.values().next())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => format!("{value}"),
+    })
+}
+
+/// Deserialize a name that can be either a plain string or a localized map.
+fn deserialize_localized_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value: JsonValue = Deserialize::deserialize(deserializer)?;
+    Ok(match &value {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Object(map) => {
+            // Prefer "en", then first available value
+            map.get("en")
+                .or_else(|| map.values().next())
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string()
+        }
+        _ => format!("{value}"),
+    })
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1190,6 +1263,29 @@ pub async fn http_response_body<R: serde::de::DeserializeOwned>(
 ) -> anyhow::Result<R> {
     let url = response.url().clone();
 
+    // Log rate limit headers when present
+    if let Some(remaining) = response
+        .headers()
+        .get("X-RateLimit-Remaining")
+        .and_then(|v| v.to_str().ok())
+    {
+        let reset = response
+            .headers()
+            .get("X-RateLimit-Reset")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        let remaining_num: i64 = remaining.parse().unwrap_or(-1);
+        if remaining_num < 1000 {
+            log::warn!(
+                "Govee API rate limit: {remaining} requests remaining (resets at {reset})"
+            );
+        } else {
+            log::trace!(
+                "Govee API rate limit: {remaining} remaining (resets at {reset})"
+            );
+        }
+    }
+
     let status = response.status();
     if !status.is_success() {
         let body_bytes = response.bytes().await.with_context(|| {
@@ -1216,24 +1312,42 @@ pub async fn http_response_body<R: serde::de::DeserializeOwned>(
     })
 }
 
+const MAX_RETRIES: u32 = 3;
+const INITIAL_BACKOFF_MS: u64 = 1000;
+
 impl GoveeApiClient {
-    async fn get_request_with_json_response<T: reqwest::IntoUrl, R: serde::de::DeserializeOwned>(
+    async fn get_request_with_json_response<
+        T: reqwest::IntoUrl + Clone,
+        R: serde::de::DeserializeOwned,
+    >(
         &self,
         url: T,
     ) -> anyhow::Result<R> {
-        let response = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
-            .build()?
-            .request(Method::GET, url)
-            .header("Govee-API-Key", &self.key)
-            .send()
-            .await?;
+            .build()?;
 
-        http_response_body(response).await
+        for attempt in 0..=MAX_RETRIES {
+            let response = client
+                .request(Method::GET, url.clone())
+                .header("Govee-API-Key", &self.key)
+                .send()
+                .await?;
+
+            match retry_or_return(response, attempt).await {
+                RetryDecision::Success(resp) => return http_response_body(resp).await,
+                RetryDecision::Retry(delay) => {
+                    tokio::time::sleep(delay).await;
+                }
+                RetryDecision::Fail(resp) => return http_response_body(resp).await,
+            }
+        }
+
+        anyhow::bail!("Govee API request failed after {MAX_RETRIES} retries");
     }
 
     async fn request_with_json_response<
-        T: reqwest::IntoUrl,
+        T: reqwest::IntoUrl + Clone,
         B: serde::Serialize,
         R: serde::de::DeserializeOwned,
     >(
@@ -1242,17 +1356,76 @@ impl GoveeApiClient {
         url: T,
         body: &B,
     ) -> anyhow::Result<R> {
-        let response = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
-            .build()?
-            .request(method, url)
-            .header("Govee-API-Key", &self.key)
-            .json(body)
-            .send()
-            .await?;
+            .build()?;
 
-        http_response_body(response).await
+        for attempt in 0..=MAX_RETRIES {
+            let response = client
+                .request(method.clone(), url.clone())
+                .header("Govee-API-Key", &self.key)
+                .json(body)
+                .send()
+                .await?;
+
+            match retry_or_return(response, attempt).await {
+                RetryDecision::Success(resp) => return http_response_body(resp).await,
+                RetryDecision::Retry(delay) => {
+                    tokio::time::sleep(delay).await;
+                }
+                RetryDecision::Fail(resp) => return http_response_body(resp).await,
+            }
+        }
+
+        anyhow::bail!("Govee API request failed after {MAX_RETRIES} retries");
     }
+}
+
+enum RetryDecision {
+    Success(reqwest::Response),
+    Retry(Duration),
+    Fail(reqwest::Response),
+}
+
+async fn retry_or_return(response: reqwest::Response, attempt: u32) -> RetryDecision {
+    let status = response.status();
+
+    if status.is_success() {
+        return RetryDecision::Success(response);
+    }
+
+    if status.as_u16() == 429 {
+        // Respect Retry-After header if present, otherwise exponential backoff
+        let delay = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_millis(INITIAL_BACKOFF_MS * 2u64.pow(attempt)));
+
+        log::warn!(
+            "Govee API rate limited (429), retry {}/{} after {:?}",
+            attempt + 1,
+            MAX_RETRIES,
+            delay
+        );
+        return RetryDecision::Retry(delay);
+    }
+
+    if status.is_server_error() && attempt < MAX_RETRIES {
+        let delay = Duration::from_millis(INITIAL_BACKOFF_MS * 2u64.pow(attempt));
+        log::warn!(
+            "Govee API server error ({}), retry {}/{} after {:?}",
+            status.as_u16(),
+            attempt + 1,
+            MAX_RETRIES,
+            delay
+        );
+        return RetryDecision::Retry(delay);
+    }
+
+    RetryDecision::Fail(response)
 }
 
 #[cfg(test)]
@@ -1430,5 +1603,93 @@ mod test {
 
         let names: Vec<_> = options.into_iter().map(|opt| opt.name).collect();
         assert_eq!(names, vec!["Forest".to_string(), "Aurora".to_string()]);
+    }
+
+    #[test]
+    fn lenient_bool_accepts_map_value() {
+        // Govee sometimes sends "required": {"foo": "bar"} instead of true/false
+        let json = r#"{"fieldName":"rgb","dataType":"INTEGER","range":{"min":0,"max":255,"precision":1},"required":{"unexpected":"map"},"defaultValue":null}"#;
+        let field: StructField = serde_json::from_str(json).unwrap();
+        assert!(field.required); // map coerces to true
+    }
+
+    #[test]
+    fn lenient_bool_accepts_string_value() {
+        let json = r#"{"fieldName":"rgb","dataType":"INTEGER","range":{"min":0,"max":255,"precision":1},"required":"true","defaultValue":null}"#;
+        let field: StructField = serde_json::from_str(json).unwrap();
+        assert!(field.required);
+    }
+
+    #[test]
+    fn lenient_bool_accepts_false() {
+        let json = r#"{"fieldName":"rgb","dataType":"INTEGER","range":{"min":0,"max":255,"precision":1},"required":false,"defaultValue":null}"#;
+        let field: StructField = serde_json::from_str(json).unwrap();
+        assert!(!field.required);
+    }
+
+    #[test]
+    fn malformed_capability_is_skipped_not_fatal() {
+        // One valid, one malformed capability — the malformed one should be skipped
+        let json = json!({
+            "sku": "H6000",
+            "device": "AA:BB",
+            "deviceName": "Test",
+            "type": "devices.types.light",
+            "capabilities": [
+                {
+                    "type": "devices.capabilities.range",
+                    "instance": "brightness",
+                    "parameters": {
+                        "dataType": "INTEGER",
+                        "unit": "unit.percent",
+                        "range": {"min": 0, "max": 100, "precision": 1}
+                    }
+                },
+                {
+                    "type": "completely.invalid",
+                    "instance": "broken",
+                    "parameters": "not-an-object"
+                }
+            ]
+        });
+
+        let info: HttpDeviceInfo = serde_json::from_value(json).unwrap();
+        // Should have parsed the valid capability and skipped the broken one
+        assert_eq!(info.capabilities.len(), 1);
+        assert_eq!(info.capabilities[0].instance, "brightness");
+    }
+
+    #[test]
+    fn localized_name_parses_plain_string() {
+        let json = json!({"name": "Forest", "value": 1});
+        let opt: EnumOption = serde_json::from_value(json).unwrap();
+        assert_eq!(opt.name, "Forest");
+    }
+
+    #[test]
+    fn localized_name_parses_object_with_en() {
+        let json = json!({"name": {"en": "Game", "de": "Spiel"}, "value": 1});
+        let opt: EnumOption = serde_json::from_value(json).unwrap();
+        assert_eq!(opt.name, "Game");
+    }
+
+    #[test]
+    fn localized_name_fallback_to_first_value() {
+        let json = json!({"name": {"de": "Spiel"}, "value": 1});
+        let opt: EnumOption = serde_json::from_value(json).unwrap();
+        assert_eq!(opt.name, "Spiel");
+    }
+
+    #[test]
+    fn localized_device_name_parses_object() {
+        let json = json!({
+            "sku": "H66A1",
+            "device": "AA:BB",
+            "deviceName": {"en": "TV Backlight", "zh": "电视背光"},
+            "type": "devices.types.light",
+            "capabilities": []
+        });
+        let info: HttpDeviceInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.device_name, "TV Backlight");
     }
 }

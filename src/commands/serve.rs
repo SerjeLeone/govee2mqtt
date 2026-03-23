@@ -1,6 +1,11 @@
 use crate::lan_api::Client as LanClient;
 use crate::platform_api::{DeviceParameters, GoveeApiClient};
 use crate::service::device::Device;
+use crate::service::ext_availability::AvailabilityExtension;
+use crate::service::ext_config_reload::ConfigReloadExtension;
+use crate::service::ext_discovery::DiscoveryExtension;
+use crate::service::ext_health::HealthExtension;
+use crate::service::extension::ExtensionManager;
 use crate::service::hass::spawn_hass_integration;
 use crate::service::http::run_http_server;
 use crate::service::iot::start_iot_client;
@@ -15,7 +20,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
-pub const POLL_INTERVAL: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::seconds(900));
+/// Default poll interval. 120s balances freshness vs rate limit budget.
+/// With the Govee push MQTT client, polling is mostly a fallback.
+/// At 120s with 20 devices: ~14,400 req/day (under the 10,000 limit
+/// if push handles most updates).
+pub const POLL_INTERVAL: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::seconds(120));
 
 #[derive(clap::Parser, Debug)]
 pub struct ServeCommand {
@@ -33,21 +42,24 @@ async fn poll_single_device(state: &StateHandle, device: &Device) -> anyhow::Res
     }
 
     // Collect the device status via the LAN API, if possible.
-    // This is partially redundant with the LAN discovery task,
-    // but the timing of that is not as regular and predictable
-    // because it employs exponential backoff.
-    // Some Govee devices have bad firmware that will cause the
-    // lights to flicker about a minute after polling, so it
-    // is desirable to keep polling on a regular basis.
+    // Skip LAN polling when the device is OFF to prevent firmware-induced
+    // flashing on some devices (e.g. H6061 Glide Hexa).
     // <https://github.com/wez/govee2mqtt/issues/250>
-    if let Some(lan_device) = &device.lan_device {
-        if let Some(client) = state.get_lan_client().await {
-            if let Ok(status) = client.query_status(lan_device).await {
-                state
-                    .device_mut(&lan_device.sku, &lan_device.device)
-                    .await
-                    .set_lan_device_status(status);
-                state.notify_of_state_change(&lan_device.device).await.ok();
+    let is_off = device
+        .device_state()
+        .map(|s| !s.on)
+        .unwrap_or(false);
+
+    if !is_off {
+        if let Some(lan_device) = &device.lan_device {
+            if let Some(client) = state.get_lan_client().await {
+                if let Ok(status) = client.query_status(lan_device).await {
+                    state
+                        .device_mut(&lan_device.sku, &lan_device.device)
+                        .await
+                        .set_lan_device_status(status);
+                    state.notify_of_state_change(&lan_device.device).await.ok();
+                }
             }
         }
     }
@@ -95,7 +107,10 @@ async fn poll_single_device(state: &StateHandle, device: &Device) -> anyhow::Res
     Ok(())
 }
 
-async fn periodic_state_poll(state: StateHandle) -> anyhow::Result<()> {
+async fn periodic_state_poll(
+    state: StateHandle,
+    extensions: Arc<ExtensionManager>,
+) -> anyhow::Result<()> {
     sleep(Duration::from_secs(20)).await;
     loop {
         for d in state.devices().await {
@@ -103,6 +118,8 @@ async fn periodic_state_poll(state: StateHandle) -> anyhow::Result<()> {
                 log::error!("while polling {d}: {err:#}");
             }
         }
+
+        extensions.tick_all(&state).await;
 
         sleep(Duration::from_secs(30)).await;
     }
@@ -174,35 +191,57 @@ const ISSUE_76_EXPLANATION: &str = "Startup cannot automatically continue becaus
 impl ServeCommand {
     pub async fn run(&self, args: &crate::Args) -> anyhow::Result<()> {
         log::info!("Starting service. version {}", govee_version());
+        crate::service::device_config::load_device_config();
+        crate::service::scene_database::load_scene_databases();
+        let mut device_db =
+            crate::service::device_database::load_device_database();
         let state = Arc::new(crate::service::state::State::new());
 
         // First, use the HTTP APIs to determine the list of devices and
-        // their names.
+        // their names. On failure, fall back to the persisted device database.
+
+        let mut api_discovery_failed = false;
 
         if let Ok(client) = args.api_args.api_client() {
             if let Err(err) =
                 enumerate_devices_via_platform_api(state.clone(), Some(client.clone())).await
             {
-                anyhow::bail!(
-                    "Error during initial platform API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
-                );
-            }
-
-            // only record the client after we've completed the
-            // initial platform disco attempt
-            state.set_platform_client(client).await;
-
-            // spawn periodic discovery task
-            let state = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(600)).await;
-                    if let Err(err) = enumerate_devices_via_platform_api(state.clone(), None).await
-                    {
-                        log::error!("Error during periodic platform API discovery: {err:#}");
-                    }
+                let err_str = format!("{err:#}");
+                if err_str.contains("dns error") || err_str.contains("Name does not resolve") {
+                    log::error!(
+                        "DNS resolution failed for Govee API. Check your network connection \
+                         and DNS settings. If running in Docker, ensure DNS is configured. \
+                         Error: {err:#}"
+                    );
+                } else if err_str.contains("connect") || err_str.contains("timeout") {
+                    log::error!(
+                        "Cannot reach Govee API servers. Check your internet connection. \
+                         Error: {err:#}"
+                    );
+                } else {
+                    log::error!("Error during initial platform API discovery: {err:#}");
                 }
-            });
+                api_discovery_failed = true;
+            } else {
+                // only record the client after we've completed the
+                // initial platform disco attempt
+                state.set_platform_client(client).await;
+
+                // spawn periodic discovery task
+                let state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_secs(600)).await;
+                        if let Err(err) =
+                            enumerate_devices_via_platform_api(state.clone(), None).await
+                        {
+                            log::error!(
+                                "Error during periodic platform API discovery: {err:#}"
+                            );
+                        }
+                    }
+                });
+            }
         }
         if let Ok(client) = args.undoc_args.api_client() {
             if let Err(err) = enumerate_devices_via_undo_api(
@@ -212,14 +251,13 @@ impl ServeCommand {
             )
             .await
             {
-                anyhow::bail!(
-                    "Error during initial undoc API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
-                );
+                log::error!("Error during initial undoc API discovery: {err:#}");
+                api_discovery_failed = true;
+            } else {
+                // only record the client after we've completed the
+                // initial undoc disco attempt
+                state.set_undoc_client(client).await;
             }
-
-            // only record the client after we've completed the
-            // initial undoc disco attempt
-            state.set_undoc_client(client).await;
 
             // spawn periodic discovery task
             let state = state.clone();
@@ -234,6 +272,45 @@ impl ServeCommand {
                     }
                 }
             });
+        }
+
+        // If API discovery succeeded, update and save the device database
+        if !api_discovery_failed {
+            let devices = state.devices().await;
+            if !devices.is_empty() {
+                crate::service::device_database::update_database_from_devices(
+                    &mut device_db,
+                    &devices,
+                );
+                if let Err(err) = crate::service::device_database::save_device_database(&device_db)
+                {
+                    log::warn!("Failed to save device database: {err:#}");
+                }
+            }
+        } else if !device_db.devices.is_empty() {
+            // API failed but we have cached device data — populate state from database
+            log::warn!(
+                "API discovery failed. Using cached device database ({} devices). \
+                 Some features may be limited.",
+                device_db.devices.len()
+            );
+            for (_id, persisted) in &device_db.devices {
+                let mut device = state
+                    .device_mut(&persisted.sku, &persisted.device_id)
+                    .await;
+                // Set minimal info so the device shows up in HA with its name
+                device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                    sku: persisted.sku.clone(),
+                    device: persisted.device_id.clone(),
+                    device_name: persisted.name.clone(),
+                    device_type: Default::default(),
+                    capabilities: vec![],
+                });
+            }
+        } else if api_discovery_failed {
+            anyhow::bail!(
+                "API discovery failed and no cached device database exists.\n{ISSUE_76_EXPLANATION}"
+            );
         }
 
         // Now start LAN discovery
@@ -354,11 +431,21 @@ impl ServeCommand {
             log::info!("");
         }
 
+        // Set up extensions
+        let mut extensions = ExtensionManager::new();
+        extensions.add(AvailabilityExtension::new());
+        extensions.add(HealthExtension);
+        extensions.add(ConfigReloadExtension);
+        extensions.add(DiscoveryExtension::new());
+        let extensions = Arc::new(extensions);
+        extensions.start_all().await;
+
         // Start periodic status polling
         {
             let state = state.clone();
+            let extensions = extensions.clone();
             tokio::spawn(async move {
-                if let Err(err) = periodic_state_poll(state).await {
+                if let Err(err) = periodic_state_poll(state, extensions).await {
                     log::error!("periodic_state_poll: {err:#}");
                 }
             });
@@ -367,8 +454,48 @@ impl ServeCommand {
         // start advertising on local mqtt
         spawn_hass_integration(state.clone(), &args.hass_args).await?;
 
-        run_http_server(state.clone(), self.http_port)
-            .await
-            .with_context(|| format!("Starting HTTP service on port {}", self.http_port))
+        // Start Govee official MQTT push subscription if API key is available
+        if let Ok(Some(api_key)) = args.api_args.opt_api_key() {
+            if let Err(err) =
+                crate::service::govee_push::start_govee_push_client(&api_key, state.clone()).await
+            {
+                log::warn!("Failed to start Govee push client: {err:#}");
+            }
+        }
+
+        // Run HTTP server with graceful shutdown on SIGTERM
+        let shutdown_state = state.clone();
+        let shutdown_extensions = extensions.clone();
+        let http_port = self.http_port;
+
+        tokio::select! {
+            result = run_http_server(state.clone(), http_port) => {
+                result.with_context(|| format!("Starting HTTP service on port {http_port}"))?;
+            }
+            _ = async {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("register SIGTERM handler");
+                    let mut sigint = signal(SignalKind::interrupt())
+                        .expect("register SIGINT handler");
+                    tokio::select! {
+                        _ = sigterm.recv() => log::info!("Received SIGTERM"),
+                        _ = sigint.recv() => log::info!("Received SIGINT"),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c().await.expect("register ctrl-c handler");
+                    log::info!("Received Ctrl-C");
+                }
+            } => {
+                shutdown_extensions.stop_all(&shutdown_state).await;
+                shutdown_state.graceful_shutdown().await;
+            }
+        }
+
+        Ok(())
     }
 }

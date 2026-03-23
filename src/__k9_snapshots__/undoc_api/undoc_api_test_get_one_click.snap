@@ -37,6 +37,7 @@ OneClickResponse {
                 video_url: None,
                 one_clicks: [
                     OneClick {
+                        component_id: None,
                         name: "woot",
                         plan_type: 0,
                         preset_id: 0,
@@ -191,8 +192,11 @@ OneClickResponse {
                                         },
                                     },
                                 ],
+                                cmd_group: 0,
                             },
                         ],
+                        action_type: None,
+                        all_sort: None,
                     },
                 ],
             },
@@ -216,6 +220,7 @@ OneClickResponse {
                 video_url: None,
                 one_clicks: [
                     OneClick {
+                        component_id: None,
                         name: "Get Home",
                         plan_type: 0,
                         preset_id: 1101,
@@ -261,6 +266,8 @@ OneClickResponse {
                         group_id: 0,
                         group_name: "",
                         iot_rules: [],
+                        action_type: None,
+                        all_sort: None,
                     },
                 ],
             },
