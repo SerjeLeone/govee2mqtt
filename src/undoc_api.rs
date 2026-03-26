@@ -661,6 +661,7 @@ pub struct OneClickIotRuleEntry {
     pub device_type: u32,
     #[serde(deserialize_with = "embedded_json", serialize_with = "as_json")]
     pub iot_msg: JsonValue,
+    pub effect: Option<JsonValue>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -711,6 +712,7 @@ pub struct OneClickIotRuleDevice {
     pub version_soft: Option<String>,
     pub wifi_soft_version: Option<String>,
     pub wifi_hard_version: Option<String>,
+    pub segment_count: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -872,6 +874,8 @@ pub struct DeviceSettings {
     /// eg: Glide Hexa. Value is base64 encoded data
     pub shapes: Option<String>,
     pub support_ble_broad_v3: Option<bool>,
+    pub support_enc: Option<bool>,
+    pub mac: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

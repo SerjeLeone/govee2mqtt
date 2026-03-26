@@ -113,6 +113,7 @@ OneClickResponse {
                                     wifi_hard_version: Some(
                                         "1.00.01",
                                     ),
+                                    segment_count: None,
                                 },
                                 rule: [
                                     OneClickIotRuleEntry {
@@ -140,6 +141,7 @@ OneClickResponse {
                                                 "type": Number(1),
                                             },
                                         },
+                                        effect: None,
                                     },
                                 ],
                                 cmd_group: 0,
@@ -225,6 +227,7 @@ OneClickResponse {
                                     wifi_hard_version: Some(
                                         "1.00.01",
                                     ),
+                                    segment_count: None,
                                 },
                                 rule: [
                                     OneClickIotRuleEntry {
@@ -252,6 +255,7 @@ OneClickResponse {
                                                 "type": Number(1),
                                             },
                                         },
+                                        effect: None,
                                     },
                                 ],
                                 cmd_group: 0,

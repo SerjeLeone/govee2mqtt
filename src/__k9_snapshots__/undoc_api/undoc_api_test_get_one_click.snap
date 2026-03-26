@@ -113,6 +113,7 @@ OneClickResponse {
                                     wifi_hard_version: Some(
                                         "1.00.10",
                                     ),
+                                    segment_count: None,
                                 },
                                 rule: [
                                     OneClickIotRuleEntry {
@@ -143,6 +144,7 @@ OneClickResponse {
                                                 "type": Number(1),
                                             },
                                         },
+                                        effect: None,
                                     },
                                     OneClickIotRuleEntry {
                                         blue_msg: Object {
@@ -190,6 +192,7 @@ OneClickResponse {
                                                 "type": Number(1),
                                             },
                                         },
+                                        effect: None,
                                     },
                                 ],
                                 cmd_group: 0,
