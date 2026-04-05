@@ -1149,7 +1149,8 @@ pub struct IntegerRange {
 pub struct EnumOption {
     /// May be a plain string or a localized object like {"en": "Game", "de": "Spiel"}.
     /// We extract the English name or fall back to the first available.
-    #[serde(deserialize_with = "deserialize_localized_name")]
+    #[serde(deserialize_with = "deserialize_name_field")]
+    // #[serde(deserialize_with = "deserialize_localized_name")]
     pub name: String,
     #[serde(default)]
     pub value: JsonValue,
@@ -1698,5 +1699,28 @@ mod test {
         });
         let info: HttpDeviceInfo = serde_json::from_value(json).unwrap();
         assert_eq!(info.device_name, "TV Backlight");
+    }
+}
+
+fn deserialize_name_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+
+    let v = Value::deserialize(deserializer)?;
+
+    match v {
+        Value::String(s) => Ok(s),
+        Value::Object(map) => {
+            if let Some(Value::String(en)) = map.get("en") {
+                Ok(en.clone())
+            } else if let Some(Value::String(key)) = map.get("key") {
+                Ok(key.clone())
+            } else {
+                Ok(serde_json::Value::Object(map).to_string())
+            }
+        }
+        _ => Ok(v.to_string()),
     }
 }

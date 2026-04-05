@@ -1,5 +1,5 @@
 ARG BUILD_FROM
-ARG GOVEE2MQTT_IMAGE=ghcr.io/sitapix/govee2mqtt:latest
+ARG GOVEE2MQTT_IMAGE=ghcr.io/serjeleone/govee2mqtt:latest
 FROM ${GOVEE2MQTT_IMAGE} AS govee2mqtt
 FROM $BUILD_FROM
 COPY run.sh /run.sh

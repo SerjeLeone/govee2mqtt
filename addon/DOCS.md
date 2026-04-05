@@ -112,7 +112,7 @@ Subscribe to `gv2mqtt/bridge/error` for error details. Common causes: rate limit
 
 ### Google Home shows devices offline
 
-Set `disable_effects: true` in the app config. See the [configuration docs](https://github.com/sitapix/govee2mqtt/blob/main/docs/CONFIG.md#effect-list-filtering) for details.
+Set `disable_effects: true` in the app config. See the [configuration docs](https://github.com/serjeleone/govee2mqtt/blob/main/docs/CONFIG.md#effect-list-filtering) for details.
 
 ### "Cannot bind to UDP Port 4002"
 
@@ -131,6 +131,6 @@ Enable the API key to get real-time push updates without polling. Enable LAN con
 
 ## More help
 
-- Repo: https://github.com/sitapix/govee2mqtt
-- Configuration: https://github.com/sitapix/govee2mqtt/blob/main/docs/CONFIG.md
-- FAQ: https://github.com/sitapix/govee2mqtt/blob/main/docs/FAQ.md
+- Repo: https://github.com/serjeleone/govee2mqtt
+- Configuration: https://github.com/serjeleone/govee2mqtt/blob/main/docs/CONFIG.md
+- FAQ: https://github.com/serjeleone/govee2mqtt/blob/main/docs/FAQ.md

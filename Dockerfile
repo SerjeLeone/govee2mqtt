@@ -38,7 +38,7 @@ COPY assets /app/assets
 COPY scene-data /app/scene-data
 
 USER govee:govee
-LABEL org.opencontainers.image.source="https://github.com/sitapix/govee2mqtt"
+LABEL org.opencontainers.image.source="https://github.com/serjeleone/govee2mqtt"
 ENV \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH \

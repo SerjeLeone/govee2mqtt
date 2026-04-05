@@ -21,7 +21,7 @@ See [CONFIG.md](CONFIG.md) for a complete list of configuration options.
 name: govee2mqtt
 services:
   govee2mqtt:
-    image: ghcr.io/sitapix/govee2mqtt:latest
+    image: ghcr.io/serjeleone/govee2mqtt:latest
     container_name: govee2mqtt
     restart: unless-stopped
     env_file:

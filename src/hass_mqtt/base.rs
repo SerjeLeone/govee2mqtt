@@ -4,7 +4,7 @@ use crate::version_info::govee_version;
 use serde::Serialize;
 
 const MODEL: &str = "gv2mqtt";
-const URL: &str = "https://github.com/sitapix/govee2mqtt";
+const URL: &str = "https://github.com/serjeleone/govee2mqtt";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AvailabilityEntry {
