@@ -217,6 +217,9 @@ impl ServeCommand {
         crate::service::device_config::load_device_config();
         crate::service::scene_database::load_scene_databases();
         let state = Arc::new(crate::service::state::State::new());
+        let cloud_fallback = args.lan_disco_args.cloud_fallback_transport()?;
+        state.set_lan_cloud_fallback(cloud_fallback).await;
+        log::info!("LAN-first segment/DreamView cloud fallback transport: {cloud_fallback}");
 
         Self::discover_devices(&state, args).await?;
         Self::start_lan_discovery(&state, args).await?;

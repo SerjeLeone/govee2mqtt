@@ -85,6 +85,7 @@ are tunable without rebuilding:
 |`--lan-query-backoff-ms`|`GOVEE_LAN_QUERY_BACKOFF_MS=350`|`lan_query_backoff_ms`|`350`|Wait after the first attempt, in milliseconds. Doubles on each retry, capped at 3000 ms (the cap is fixed). Defaults give waits of 350 ms → 700 ms → 1400 ms, ~2.5 s total.|
 |`--lan-breaker-threshold`|`GOVEE_LAN_BREAKER_THRESHOLD=3`|`lan_breaker_threshold`|`3`|After this many consecutive timeouts, background polling of that device is suspended (circuit breaker). `0` disables the breaker.|
 |`--lan-breaker-cooldown`|`GOVEE_LAN_BREAKER_COOLDOWN=300`|`lan_breaker_cooldown`|`300`|Suspension length in seconds, clamped to 30–900. Doubles on repeated failure, capped at 900 s.|
+|`--lan-cloud-fallback <transport>`|`GOVEE_LAN_CLOUD_FALLBACK=platform`|`lan_cloud_fallback`|`disabled`|Optional second transport for segment and `dreamViewToggle` commands: `disabled`, `iot`, or `platform`. LAN is always tried first.|
 
 The tradeoff: lowering attempts makes a congested network recover faster but
 makes a slow-to-respond device more likely to report stale state. If you have
@@ -104,6 +105,25 @@ stays suspended, at the cost of one probe per discovery cycle. Note that a
 timed-out confirmation poll still counts toward the breaker threshold even
 though it is never blocked: unreachability is evidence no matter which poll
 observed it.
+
+### LAN-first feature fallback
+
+Segment color/off and hardware DreamView (`dreamViewToggle`) commands use LAN
+`ptReal` first. A `ptReal` UDP write has no acknowledgement, so the bridge runs
+one status-query cycle using `lan_query_attempts` and `lan_query_backoff_ms` as a
+liveness check. It uses the configured cloud fallback only if those LAN probes
+fail or the device was not discovered on LAN. Cloud credentials alone never
+enable this fallback.
+
+The `iot` fallback is attempted only when account login has produced an IoT
+client and the device metadata contains a usable IoT topic. This explicit
+selection overrides conservative automatic-routing defaults in device quirks;
+it does not alter transport selection for any other commands.
+
+Independent segment brightness has no verified LAN `ptReal` packet. A
+brightness-only segment command therefore needs the `platform` fallback;
+segment color and off remain local. Camera-based video sync that is not exposed
+as `dreamViewToggle` is not covered by this setting.
 
 See [LAN API requirements and troubleshooting](LAN.md) for port and network
 topology details.
@@ -215,6 +235,8 @@ device quirks without code changes:
     "color_temp_range": [2700, 6500],
     "lan_api_capable": true,
     "iot_api_supported": true,
+    "segment_count": 15,
+    "supports_dreamview": true,
     "device_type": "light"
   }
 ]

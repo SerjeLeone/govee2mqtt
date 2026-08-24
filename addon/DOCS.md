@@ -23,6 +23,7 @@ Common options:
 - `disable_effects`: Disable effects in MQTT discovery (fixes Google Home offline issue)
 - `allowed_effects`: Comma-separated whitelist of effect names to include
 - `lan_query_attempts`, `lan_query_backoff_ms`, `lan_breaker_threshold`, `lan_breaker_cooldown`: Bound LAN status traffic from unresponsive devices
+- `lan_cloud_fallback`: Optional second transport for segment and DreamView commands. `disabled` (default) never sends those commands to Govee Cloud; `iot` requires account credentials and a device IoT topic; `platform` requires an API key. LAN is always attempted first, and fallback starts only after the configured LAN status-query attempts fail.
 - `music_palette`: Enable the experimental LAN-only custom music palette topic
 
 If `mqtt_host` is left empty, the app waits for the Home Assistant MQTT service and uses the broker details provided by Supervisor.
@@ -85,6 +86,8 @@ If your device model isn't recognized, create `/data/govee-quirks.json`:
     "supports_rgb": true,
     "supports_brightness": true,
     "lan_api_capable": true,
+    "segment_count": 15,
+    "supports_dreamview": true,
     "device_type": "light"
   }
 ]

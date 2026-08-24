@@ -105,6 +105,14 @@ impl EntityInstance for CapabilitySwitch {
             return Ok(());
         }
 
+        if self.instance_name == "dreamViewToggle" {
+            if let Some(enabled) = device.dreamview_enabled() {
+                return client
+                    .publish(&self.switch.state_topic, if enabled { "ON" } else { "OFF" })
+                    .await;
+            }
+        }
+
         // TODO: currently, Govee don't return any meaningful data on
         // additional states. When they do, we'll need to start reporting
         // it here, but we'll also need to start polling it from the
@@ -229,9 +237,10 @@ pub async fn mqtt_set_music_auto_color(
 
 #[cfg(test)]
 mod tests {
-    use super::MusicAutoColorSwitch;
+    use super::{CapabilitySwitch, MusicAutoColorSwitch};
     use crate::hass_mqtt::instance::EntityInstance;
     use crate::service::device::Device;
+    use crate::service::hass::HassClient;
     use crate::service::state::State;
     use std::sync::Arc;
 
@@ -259,6 +268,39 @@ mod tests {
             "gv2mqtt/switch/AABB/powerSwitch/state"
         );
         assert!(switch.enabled_by_default.is_none());
+    }
+
+    #[tokio::test]
+    async fn dreamview_switch_publishes_optimistic_local_state() {
+        use crate::platform_api::{DeviceCapability, DeviceCapabilityKind};
+
+        let state = Arc::new(State::new());
+        {
+            let mut stored = state.device_mut("H66A1", "AA:BB").await;
+            stored.set_dreamview_enabled(true);
+        }
+        let device = state.device_by_id("AA:BB").await.unwrap();
+        let capability = DeviceCapability {
+            kind: DeviceCapabilityKind::Toggle,
+            instance: "dreamViewToggle".to_string(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        };
+        let entity = CapabilitySwitch::new(&device, &state, &capability)
+            .await
+            .unwrap();
+        let client = HassClient::new_test();
+
+        entity.notify_state(&client).await.unwrap();
+
+        assert_eq!(
+            client.published_messages(),
+            vec![(
+                "gv2mqtt/switch/AABB/dreamViewToggle/state".to_string(),
+                "ON".to_string()
+            )]
+        );
     }
 
     #[test]

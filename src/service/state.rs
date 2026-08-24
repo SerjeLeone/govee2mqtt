@@ -1,7 +1,10 @@
 use crate::ble::{
     Base64HexBytes, SetHumidifierMode, SetHumidifierNightlightParams, SetMusicPalette,
 };
-use crate::lan_api::{Client as LanClient, DeviceStatus as LanDeviceStatus, LanDevice};
+use crate::lan_api::{
+    dreamview_ptreal_commands, segment_color_ptreal_commands, Client as LanClient,
+    CloudFallbackTransport, DeviceColor, DeviceStatus as LanDeviceStatus, LanDevice,
+};
 use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient, HttpRequestFailed};
 use crate::service::coordinator::Coordinator;
 use crate::service::device::Device;
@@ -50,6 +53,7 @@ pub struct State {
     hass_client: Mutex<Option<HassClient>>,
     hass_discovery_prefix: Mutex<String>,
     temperature_scale: Mutex<TemperatureScale>,
+    lan_cloud_fallback: Mutex<CloudFallbackTransport>,
     pub event_bus: crate::service::event_bus::EventBus,
     /// Govee official MQTT push stats
     pub push_connected: std::sync::atomic::AtomicBool,
@@ -68,6 +72,7 @@ impl Default for State {
             hass_client: Default::default(),
             hass_discovery_prefix: Default::default(),
             temperature_scale: Default::default(),
+            lan_cloud_fallback: Default::default(),
             event_bus: crate::service::event_bus::EventBus::new(),
             push_connected: std::sync::atomic::AtomicBool::new(false),
             push_event_count: std::sync::atomic::AtomicU64::new(0),
@@ -76,6 +81,29 @@ impl Default for State {
 }
 
 pub type StateHandle = Arc<State>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeatureTransport {
+    Lan,
+    Iot,
+    Platform,
+}
+
+fn feature_transport_order(
+    has_lan_device: bool,
+    fallback: CloudFallbackTransport,
+) -> Vec<FeatureTransport> {
+    let mut order = vec![];
+    if has_lan_device {
+        order.push(FeatureTransport::Lan);
+    }
+    match fallback {
+        CloudFallbackTransport::Disabled => {}
+        CloudFallbackTransport::Iot => order.push(FeatureTransport::Iot),
+        CloudFallbackTransport::Platform => order.push(FeatureTransport::Platform),
+    }
+    order
+}
 
 impl State {
     pub fn new() -> Self {
@@ -88,6 +116,14 @@ impl State {
 
     pub async fn get_temperature_scale(&self) -> TemperatureScale {
         *self.temperature_scale.lock().await
+    }
+
+    pub async fn set_lan_cloud_fallback(&self, transport: CloudFallbackTransport) {
+        *self.lan_cloud_fallback.lock().await = transport;
+    }
+
+    pub async fn get_lan_cloud_fallback(&self) -> CloudFallbackTransport {
+        *self.lan_cloud_fallback.lock().await
     }
 
     pub async fn set_hass_disco_prefix(&self, prefix: String) {
@@ -255,6 +291,18 @@ impl State {
         Some((iot, entry))
     }
 
+    /// Resolve the explicitly selected IoT feature fallback from runtime
+    /// metadata. Unlike normal automatic routing, this is a user override, so
+    /// an old quirk default must not hide a device that has a real IoT topic.
+    async fn explicit_iot_fallback_for_device<'d>(
+        &self,
+        device: &'d Device,
+    ) -> Option<(IotClient, &'d crate::undoc_api::DeviceEntry)> {
+        let iot = self.get_iot_client().await?;
+        let entry = &device.undoc_device_info.as_ref()?.entry;
+        iot.is_device_compatible(entry).then_some((iot, entry))
+    }
+
     pub async fn poll_iot_api(self: &Arc<Self>, device: &Device) -> anyhow::Result<bool> {
         if let Some(iot) = self.get_iot_client().await {
             if let Some(info) = device.undoc_device_info.clone() {
@@ -380,6 +428,274 @@ impl State {
             }
             None => anyhow::bail!("no lan client"),
         }
+    }
+
+    /// Deliver a feature packet over LAN, then require a `devStatus` reply.
+    /// `ptReal` itself is UDP and has no acknowledgement, so the status query
+    /// is a liveness check rather than value verification. Its retry schedule
+    /// is the configured `GOVEE_LAN_QUERY_ATTEMPTS` policy.
+    async fn send_lan_feature_command(
+        self: &Arc<Self>,
+        device: &Device,
+        feature: &str,
+        commands: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let lan_device = device
+            .lan_device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{device} was not discovered on the LAN"))?;
+        let client = self
+            .get_lan_client()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("LAN client is not running"))?;
+
+        log::info!("Using LAN API to set {feature} for {device}");
+        lan_device
+            .send_real(commands)
+            .await
+            .with_context(|| format!("send {feature} to {device} over LAN"))?;
+
+        let status = client.query_status(lan_device).await.with_context(|| {
+            format!("{device} did not answer LAN status probes after {feature}")
+        })?;
+        self.device_mut(&device.sku, &device.id)
+            .await
+            .set_lan_device_status(status);
+        Ok(())
+    }
+
+    async fn send_platform_segment_command(
+        self: &Arc<Self>,
+        device: &Device,
+        segment: u32,
+        off: bool,
+        brightness: Option<u8>,
+        color: Option<DeviceColor>,
+    ) -> anyhow::Result<()> {
+        if off {
+            anyhow::bail!(
+                "Platform API cannot safely turn off one segment; LAN or IoT ptReal is required"
+            );
+        }
+        let client = self.get_platform_client().await.ok_or_else(|| {
+            anyhow::anyhow!("Platform fallback is selected but no API client is available")
+        })?;
+        let info = device
+            .http_device_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Platform metadata is missing for {device}"))?;
+
+        log::info!("Using configured Platform fallback for {device} segment {segment}");
+        if let Some(brightness) = brightness {
+            client
+                .set_segment_brightness(info, segment, brightness)
+                .await?;
+        }
+        if let Some(color) = color {
+            client
+                .set_segment_rgb(info, segment, color.r, color.g, color.b)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send_platform_dreamview_command(
+        self: &Arc<Self>,
+        device: &Device,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let client = self.get_platform_client().await.ok_or_else(|| {
+            anyhow::anyhow!("Platform fallback is selected but no API client is available")
+        })?;
+        let info = device
+            .http_device_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Platform metadata is missing for {device}"))?;
+
+        log::info!("Using configured Platform fallback to set DreamView for {device}");
+        client
+            .set_toggle_state(info, "dreamViewToggle", enabled)
+            .await?;
+        Ok(())
+    }
+
+    /// Set an RGBIC segment with LAN as the mandatory first transport.
+    /// Independent segment brightness is not part of the verified LAN packet;
+    /// brightness-only commands therefore require an explicitly selected
+    /// Platform fallback.
+    pub async fn device_set_segment(
+        self: &Arc<Self>,
+        device: &Device,
+        segment: u32,
+        off: bool,
+        brightness: Option<u8>,
+        color: Option<DeviceColor>,
+    ) -> anyhow::Result<()> {
+        if !off && brightness.is_none() && color.is_none() {
+            return Ok(());
+        }
+
+        let fallback = self.get_lan_cloud_fallback().await;
+        let order = feature_transport_order(device.lan_device.is_some(), fallback);
+        if order.is_empty() {
+            anyhow::bail!(
+                "Unable to control segment {segment} for {device}: device was not discovered on \
+                 LAN and LAN cloud fallback is disabled"
+            );
+        }
+
+        let local_color = if off {
+            Some(DeviceColor { r: 0, g: 0, b: 0 })
+        } else {
+            color
+        };
+        let mut failures = vec![];
+
+        for transport in order {
+            let result = match transport {
+                FeatureTransport::Lan => match local_color {
+                    Some(color) => {
+                        if brightness.is_some() && !off {
+                            log::debug!(
+                                "LAN segment packets do not expose independent brightness; \
+                                 applying RGB locally for {device} segment {segment}"
+                            );
+                        }
+                        self.send_lan_feature_command(
+                            device,
+                            &format!("segment {segment}"),
+                            segment_color_ptreal_commands(segment, color.r, color.g, color.b),
+                        )
+                        .await
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "independent segment brightness is not supported by the LAN protocol"
+                    )),
+                },
+                FeatureTransport::Iot => match local_color {
+                    Some(color) => match self.explicit_iot_fallback_for_device(device).await {
+                        Some((iot, entry)) => {
+                            log::info!(
+                                "Using configured IoT fallback for {device} segment {segment}"
+                            );
+                            iot.send_real(
+                                entry,
+                                segment_color_ptreal_commands(segment, color.r, color.g, color.b),
+                            )
+                            .await
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "IoT fallback is not available for {device}"
+                        )),
+                    },
+                    None => Err(anyhow::anyhow!(
+                        "independent segment brightness is not supported by the IoT ptReal path"
+                    )),
+                },
+                FeatureTransport::Platform => {
+                    self.send_platform_segment_command(device, segment, off, brightness, color)
+                        .await
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    if local_color.is_some() {
+                        let mut stored = self.device_mut(&device.sku, &device.id).await;
+                        stored.set_active_scene(None);
+                        stored.set_dreamview_enabled(false);
+                    }
+                    self.notify_of_state_change(&device.id).await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "{transport:?} segment control failed for {device} segment {segment}: \
+                         {err:#}"
+                    );
+                    failures.push(format!("{transport:?}: {err:#}"));
+                }
+            }
+        }
+
+        let fallback_hint = if fallback == CloudFallbackTransport::Disabled {
+            "; cloud fallback is disabled"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "Unable to control segment {segment} for {device}{fallback_hint}: {}",
+            failures.join("; ")
+        )
+    }
+
+    /// Toggle the hardware DreamView switch. LAN `ptReal` always runs first;
+    /// the selected cloud transport is attempted only when LAN is unavailable
+    /// or fails its configured liveness probes.
+    pub async fn device_set_dreamview(
+        self: &Arc<Self>,
+        device: &Device,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let fallback = self.get_lan_cloud_fallback().await;
+        let order = feature_transport_order(device.lan_device.is_some(), fallback);
+        if order.is_empty() {
+            anyhow::bail!(
+                "Unable to set DreamView for {device}: device was not discovered on LAN and LAN \
+                 cloud fallback is disabled"
+            );
+        }
+
+        let mut failures = vec![];
+        for transport in order {
+            let result = match transport {
+                FeatureTransport::Lan => {
+                    self.send_lan_feature_command(
+                        device,
+                        "DreamView",
+                        dreamview_ptreal_commands(enabled),
+                    )
+                    .await
+                }
+                FeatureTransport::Iot => match self.explicit_iot_fallback_for_device(device).await {
+                    Some((iot, entry)) => {
+                        log::info!("Using configured IoT fallback to set DreamView for {device}");
+                        iot.send_real(entry, dreamview_ptreal_commands(enabled))
+                            .await
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "IoT fallback is not available for {device}"
+                    )),
+                },
+                FeatureTransport::Platform => {
+                    self.send_platform_dreamview_command(device, enabled).await
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_dreamview_enabled(enabled);
+                    self.notify_of_state_change(&device.id).await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!("{transport:?} DreamView control failed for {device}: {err:#}");
+                    failures.push(format!("{transport:?}: {err:#}"));
+                }
+            }
+        }
+
+        let fallback_hint = if fallback == CloudFallbackTransport::Disabled {
+            "; cloud fallback is disabled"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "Unable to set DreamView for {device}{fallback_hint}: {}",
+            failures.join("; ")
+        )
     }
 
     pub async fn device_control<V: Into<JsonValue>>(
@@ -1313,13 +1629,56 @@ fn enum_capability_names_from_device_info(device: &Device, instance: &str) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_scene_catalog_sources, sort_and_dedup_scenes, State};
-    use crate::lan_api::LanDevice;
+    use super::{
+        feature_transport_order, merge_scene_catalog_sources, sort_and_dedup_scenes,
+        FeatureTransport, State,
+    };
+    use crate::lan_api::{CloudFallbackTransport, LanDevice};
     use crate::platform_api::HttpDeviceInfo;
     use crate::undoc_api::{LightEffectCategory, LightEffectEntry, LightEffectScene};
     use serde_json::json;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    #[test]
+    fn feature_transport_order_is_lan_first_and_opt_in() {
+        assert_eq!(
+            feature_transport_order(true, CloudFallbackTransport::Disabled),
+            vec![FeatureTransport::Lan]
+        );
+        assert_eq!(
+            feature_transport_order(true, CloudFallbackTransport::Iot),
+            vec![FeatureTransport::Lan, FeatureTransport::Iot]
+        );
+        assert_eq!(
+            feature_transport_order(true, CloudFallbackTransport::Platform),
+            vec![FeatureTransport::Lan, FeatureTransport::Platform]
+        );
+        assert_eq!(
+            feature_transport_order(false, CloudFallbackTransport::Disabled),
+            Vec::<FeatureTransport>::new()
+        );
+        assert_eq!(
+            feature_transport_order(false, CloudFallbackTransport::Platform),
+            vec![FeatureTransport::Platform]
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_fallback_defaults_disabled_and_requires_explicit_selection() {
+        let state = State::new();
+        assert_eq!(
+            state.get_lan_cloud_fallback().await,
+            CloudFallbackTransport::Disabled
+        );
+        state
+            .set_lan_cloud_fallback(CloudFallbackTransport::Iot)
+            .await;
+        assert_eq!(
+            state.get_lan_cloud_fallback().await,
+            CloudFallbackTransport::Iot
+        );
+    }
 
     #[tokio::test]
     async fn resolve_device_matches_supported_labels_case_insensitively() {

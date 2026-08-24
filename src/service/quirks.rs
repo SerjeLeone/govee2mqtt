@@ -40,6 +40,9 @@ pub struct Quirk {
     pub show_as_preset_buttons: Option<&'static [&'static str]>,
     /// Number of controllable segments, if the Platform API doesn't report them.
     pub segment_count: Option<u32>,
+    /// Expose the local DreamView switch even when cloud capability metadata
+    /// is unavailable during an offline startup.
+    pub supports_dreamview: bool,
 }
 
 impl Quirk {
@@ -63,6 +66,7 @@ impl Quirk {
             iot_api_supported: false,
             show_as_preset_buttons: None,
             segment_count: None,
+            supports_dreamview: false,
         }
     }
 
@@ -153,6 +157,11 @@ impl Quirk {
         self
     }
 
+    pub fn with_dreamview(mut self) -> Self {
+        self.supports_dreamview = true;
+        self
+    }
+
     pub fn with_ble_only(mut self, ble_only: bool) -> Self {
         self.ble_only = ble_only;
         self
@@ -198,6 +207,10 @@ struct ExternalQuirk {
     pub device_type: String,
     #[serde(default)]
     pub iot_api_supported: bool,
+    #[serde(default)]
+    pub supports_dreamview: bool,
+    #[serde(default)]
+    pub segment_count: Option<u32>,
 }
 
 fn default_icon() -> String {
@@ -267,7 +280,8 @@ fn load_external_quirks(map: &mut HashMap<String, Quirk>) {
             platform_humidity_sensor_units: None,
             iot_api_supported: ext.iot_api_supported,
             show_as_preset_buttons: None,
-            segment_count: None,
+            segment_count: ext.segment_count,
+            supports_dreamview: ext.supports_dreamview,
         };
         if map.contains_key(&ext.sku) {
             log::info!("External quirk overrides built-in for SKU {}", ext.sku);
@@ -442,6 +456,10 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H618C", STRIP),
         Quirk::lan_api_capable_light("H618E", STRIP),
         Quirk::lan_api_capable_light("H618F", STRIP),
+        // DreamView T1. The verified ptReal path is IoT rather than Govee LAN,
+        // so keep cloud use subject to the explicit fallback setting without
+        // changing automatic transport selection for its other commands.
+        Quirk::light("H6199", TV_BACK).with_dreamview(),
         Quirk::lan_api_capable_light("H619A", STRIP),
         Quirk::lan_api_capable_light("H619D", STRIP),
         Quirk::lan_api_capable_light("H619E", STRIP),
@@ -458,7 +476,7 @@ fn load_quirks() -> HashMap<String, Quirk> {
         // Segment count over-reported (16) vs actual (12); leaving segments alone since
         // the user notes extras can be ignored. <https://github.com/wez/govee2mqtt/issues/567>
         Quirk::lan_api_capable_light("H61E5", STRIP).with_color_temp_range(2700, 6500),
-        Quirk::lan_api_capable_light("H66A1", TV_BACK),
+        Quirk::lan_api_capable_light("H66A1", TV_BACK).with_dreamview(),
         Quirk::lan_api_capable_light("H7012", STRING),
         Quirk::lan_api_capable_light("H7013", STRING),
         Quirk::lan_api_capable_light("H7021", STRING),

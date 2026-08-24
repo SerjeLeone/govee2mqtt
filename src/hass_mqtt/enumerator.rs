@@ -214,6 +214,7 @@ pub async fn enumerate_entities_for_device<'a>(
     }
 
     let mut has_dedicated_scene_controls = false;
+    let mut has_dreamview_switch = false;
 
     if let Some(info) = &d.http_device_info {
         for (instance, label) in [
@@ -236,6 +237,9 @@ pub async fn enumerate_entities_for_device<'a>(
         }
 
         for cap in &info.capabilities {
+            if cap.instance == "dreamViewToggle" {
+                has_dreamview_switch = true;
+            }
             match &cap.kind {
                 DeviceCapabilityKind::Toggle | DeviceCapabilityKind::OnOff => {
                     entities.add(CapabilitySwitch::new(&d, state, cap).await?);
@@ -277,16 +281,33 @@ pub async fn enumerate_entities_for_device<'a>(
             }
         }
 
-        let segments = info.supports_segmented_rgb().or_else(|| {
-            // Fall back to quirk-defined segment count when API doesn't report it
+    }
+
+    if d.supports_dreamview() && !has_dreamview_switch {
+        let capability = DeviceCapability {
+            kind: DeviceCapabilityKind::Toggle,
+            instance: "dreamViewToggle".to_string(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        };
+        entities.add(CapabilitySwitch::new(d, state, &capability).await?);
+    }
+
+    let segments = d
+        .http_device_info
+        .as_ref()
+        .and_then(|info| info.supports_segmented_rgb())
+        .or_else(|| {
+            // Fall back to quirk-defined segment count even during a fully
+            // offline startup with no Platform metadata.
             d.resolve_quirk()
                 .and_then(|q| q.segment_count)
                 .map(|count| 0..count)
         });
-        if let Some(segments) = segments {
-            for n in segments {
-                entities.add(DeviceLight::for_device(&d, state, Some(n)).await?);
-            }
+    if let Some(segments) = segments {
+        for n in segments {
+            entities.add(DeviceLight::for_device(&d, state, Some(n)).await?);
         }
     }
 

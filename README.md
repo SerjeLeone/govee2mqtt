@@ -23,8 +23,9 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 * Two-factor login support with one-shot verification codes and a configurable
   Govee Home app version for recovering from upstream login changes.
 * Support for the official [Platform
-  API](https://developer.govee.com/reference/get-you-devices) in case the AWS
-  IoT or LAN control is unavailable.
+  API](https://developer.govee.com/reference/get-you-devices). For segment and
+  DreamView commands, cloud fallback is disabled by default and must be
+  explicitly selected; LAN always remains first.
 * Real-time state updates via the official Govee MQTT push API (requires API key).
 * Per-device and per-segment color control via LAN.
 * Device grouping — control multiple devices as one light entity.
@@ -45,7 +46,8 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 |Music Modes|API Key|Find in the list of Effects for the light in Home Assistant|
 |Tap-to-Run / One Click Scene|IoT|Find in the overall list of Scenes in Home Assistant, as well as under the `Govee to MQTT` device|
 |Live Device Status Updates|LAN and/or IoT and/or API Key|Devices typically report most changes within a couple of seconds.|
-|Segment Color|API Key or LAN|Find the `Segment 00X` light entities associated with your main light device in Home Assistant|
+|Segment Color|LAN; optional cloud fallback|Find the `Segment 00X` light entities associated with your main light device in Home Assistant. LAN is always attempted first.|
+|DreamView|LAN; optional cloud fallback|Hardware `dreamViewToggle` devices are controlled with LAN `ptReal` first. Camera-only video sync is not exposed.|
 |Energy Monitoring|API Key|Smart plugs expose power, voltage, current, and energy sensors|
 |Effect List Filtering|API Key|Disable or filter effects for Google Home compatibility|
 |Device Groups|Config file|Control multiple devices as a single HA light entity|
@@ -64,7 +66,10 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 | Platform API | API key | Full except one-click | Poll (120s default) | Medium |
 | Govee Push | API key | Read-only | Real-time push | Low |
 
-The bridge automatically picks the best available channel for each device and command.
+The bridge picks the best available channel for each device and command. For
+segments and DreamView, this policy is deliberately stricter: LAN is first and
+the cloud is used only when `lan_cloud_fallback` explicitly names `iot` or
+`platform`.
 
 * `API Key` means that you have [applied for a key from Govee](https://developer.govee.com/reference/apply-you-govee-api-key)
   and have configured it for use in govee2mqtt

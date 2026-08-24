@@ -848,59 +848,16 @@ async fn mqtt_light_segment_command(
     let command: HassLightCommand = from_json(&payload)?;
     log::info!("Command for {device} segment {segment}: {payload}");
 
-    if let Some(client) = state.get_platform_client().await {
-        let info = device
-            .http_device_info
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("HTTP device info is missing"))?;
-
-        log::info!("Using Platform API to control {device} segment");
-
-        if let Some(brightness) = command.brightness {
-            client
-                .set_segment_brightness(&info, segment, brightness)
-                .await?;
-        } else if command.state == "OFF" {
-            // Do nothing here. We used to set brightness to zero,
-            // but it is problematic:
-            // * Some devices don't have a 0
-            // * Setting it to 0 will power up the rest of the device,
-            //   so if HASS is turning off all lights in an area, the
-            //   effect is that they will turn off and then immediate
-            //   on again when there are segments involved
-            // client.set_segment_brightness(&info, segment, 0).await?;
-        }
-        if let Some(color) = &command.color {
-            client
-                .set_segment_rgb(&info, segment, color.r, color.g, color.b)
-                .await?;
-            state
-                .device_mut(&device.sku, &device.id)
-                .await
-                .set_active_scene(None);
-        }
-    } else if let Some(lan_dev) = &device.lan_device {
-        // LAN fallback for segment control via ptReal binary protocol
-        log::info!("Using LAN API to control {device} segment {segment}");
-        if command.state == "OFF" {
-            // Turn off segment by setting it to black via LAN ptReal
-            lan_dev.send_segment_color_rgb(segment, 0, 0, 0).await?;
-        }
-        if let Some(color) = &command.color {
-            lan_dev
-                .send_segment_color_rgb(segment, color.r, color.g, color.b)
-                .await?;
-            // A solid per-segment color ends any scene the bridge had applied.
-            state
-                .device_mut(&device.sku, &device.id)
-                .await
-                .set_active_scene(None);
-        }
-    } else {
-        anyhow::bail!("set segments for {device}: no API available for segment control");
-    }
-
-    Ok(())
+    state
+        .device_set_segment(
+            &device,
+            segment,
+            command.state == "OFF",
+            command.brightness,
+            command.color,
+        )
+        .await
+        .context("mqtt_light_segment_command: LAN-first segment control")
 }
 
 async fn mqtt_purge_caches(State(state): State<StateHandle>) -> anyhow::Result<()> {
@@ -1093,6 +1050,8 @@ async fn mqtt_switch_command(
 
     if instance == "powerSwitch" {
         state.device_power_on(&device, on).await?;
+    } else if instance == "dreamViewToggle" {
+        state.device_set_dreamview(&device, on).await?;
     } else if let Some(client) = state.get_platform_client().await {
         if let Some(http_dev) = &device.http_device_info {
             client.set_toggle_state(http_dev, &instance, on).await?;

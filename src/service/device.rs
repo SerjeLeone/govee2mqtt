@@ -58,6 +58,9 @@ pub struct Device {
 
     active_scene: Option<ActiveSceneInfo>,
     active_music_mode: Option<ActiveMusicModeInfo>,
+    /// DreamView is not reported by LAN devStatus, so local/IoT commands are
+    /// tracked optimistically until a Platform state poll supplies a value.
+    dreamview_enabled: Option<bool>,
     /// Cached merged scene catalog, including category and image metadata.
     scene_catalog_cache: Option<SceneCatalogCache>,
 }
@@ -266,6 +269,20 @@ impl Device {
         self.active_music_mode.as_ref()
     }
 
+    pub fn dreamview_enabled(&self) -> Option<bool> {
+        self.dreamview_enabled
+    }
+
+    pub fn set_dreamview_enabled(&mut self, enabled: bool) {
+        self.dreamview_enabled = Some(enabled);
+        if enabled {
+            // DreamView, scenes and music modes are mutually exclusive on the
+            // device. Keep our optimistic state consistent with that behavior.
+            self.active_scene.take();
+            self.active_music_mode.take();
+        }
+    }
+
     /// Update the LAN device information
     pub fn set_lan_device(&mut self, device: LanDevice) {
         self.lan_device.replace(device);
@@ -297,6 +314,13 @@ impl Device {
     }
 
     pub fn set_http_device_state(&mut self, state: HttpDeviceState) {
+        if let Some(enabled) = state
+            .capability_by_instance("dreamViewToggle")
+            .and_then(|cap| cap.state.pointer("/value").and_then(|value| value.as_i64()))
+            .map(|value| value != 0)
+        {
+            self.set_dreamview_enabled(enabled);
+        }
         self.http_device_state.replace(state);
         self.last_http_device_state_update.replace(Utc::now());
         self.clear_scene_if_light_powered_off(self.compute_http_device_state());
@@ -478,6 +502,7 @@ impl Device {
                 self.active_music_mode.take();
             }
             Some(scene) => {
+                self.dreamview_enabled = Some(false);
                 if instance != Some("musicMode") {
                     self.active_music_mode.take();
                 }
@@ -497,6 +522,7 @@ impl Device {
         if is_light_off {
             self.active_scene.take();
             self.active_music_mode.take();
+            self.dreamview_enabled = Some(false);
         }
     }
 
@@ -731,6 +757,15 @@ impl Device {
             .unwrap_or(false)
     }
 
+    pub fn supports_dreamview(&self) -> bool {
+        self.get_capability_by_instance("dreamViewToggle")
+            .is_some()
+            || self
+                .resolve_quirk()
+                .map(|quirk| quirk.supports_dreamview)
+                .unwrap_or(false)
+    }
+
     pub fn is_ble_only_device(&self) -> Option<bool> {
         if let Some(quirk) = self.resolve_quirk() {
             return Some(quirk.ble_only);
@@ -762,6 +797,8 @@ impl Device {
 mod tests {
     use super::Device;
     use crate::lan_api::{DeviceColor, DeviceStatus};
+    use crate::platform_api::{DeviceCapabilityKind, DeviceCapabilityState, HttpDeviceState};
+    use serde_json::json;
 
     #[test]
     fn animated_scene_survives_color_changes_and_clears_when_powered_off() {
@@ -837,6 +874,47 @@ mod tests {
         assert_eq!(device.active_scene_name(), Some("Sunrise"));
         assert_eq!(device.active_scene_instance(), Some("lightScene"));
         assert!(device.active_music_mode().is_none());
+    }
+
+    #[test]
+    fn dreamview_state_is_optimistic_and_mutually_exclusive_with_scenes() {
+        let mut device = Device::new("H66A1", "aa:bb");
+        device.set_active_scene(Some("Sunrise"));
+
+        device.set_dreamview_enabled(true);
+        assert_eq!(device.dreamview_enabled(), Some(true));
+        assert!(device.active_scene_name().is_none());
+        assert!(device.active_music_mode().is_none());
+
+        device.set_active_scene(Some("Ocean"));
+        assert_eq!(device.dreamview_enabled(), Some(false));
+        assert_eq!(device.active_scene_name(), Some("Ocean"));
+    }
+
+    #[test]
+    fn verified_models_expose_dreamview_without_cloud_metadata() {
+        for sku in ["H66A1", "H6199"] {
+            let device = Device::new(sku, "aa:bb");
+            assert!(device.supports_dreamview(), "{sku}");
+        }
+    }
+
+    #[test]
+    fn platform_state_reconciles_optimistic_dreamview_state() {
+        let mut device = Device::new("H66A1", "aa:bb");
+        device.set_dreamview_enabled(true);
+
+        device.set_http_device_state(HttpDeviceState {
+            sku: "H66A1".to_string(),
+            device: "aa:bb".to_string(),
+            capabilities: vec![DeviceCapabilityState {
+                kind: DeviceCapabilityKind::Toggle,
+                instance: "dreamViewToggle".to_string(),
+                state: json!({"value": 0}),
+            }],
+        });
+
+        assert_eq!(device.dreamview_enabled(), Some(false));
     }
 }
 

@@ -33,6 +33,40 @@ const CMD_PORT: u16 = 4003;
 /// The multicast group of which govee LAN-API enabled devices are members
 const MULTICAST: IpAddr = IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250));
 
+/// Optional cloud transport used only after a local feature command cannot be
+/// delivered. Merely configuring cloud credentials must not change routing:
+/// the operator has to opt in to one concrete fallback transport.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloudFallbackTransport {
+    #[default]
+    Disabled,
+    Iot,
+    Platform,
+}
+
+impl CloudFallbackTransport {
+    fn parse_config(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "none" | "off" => Ok(Self::Disabled),
+            "iot" => Ok(Self::Iot),
+            "platform" => Ok(Self::Platform),
+            _ => anyhow::bail!(
+                "invalid cloud fallback '{value}', expected disabled, iot, or platform"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for CloudFallbackTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Disabled => "disabled",
+            Self::Iot => "iot",
+            Self::Platform => "platform",
+        })
+    }
+}
+
 #[derive(clap::Parser, Debug)]
 pub struct LanDiscoArguments {
     /// Prevent the use of the default multicast broadcast address.
@@ -84,6 +118,12 @@ pub struct LanDiscoArguments {
     /// You may also set GOVEE_LAN_BREAKER_COOLDOWN via the environment.
     #[arg(long, default_value_t = 300, global = true)]
     lan_breaker_cooldown: u64,
+
+    /// Optional cloud fallback for LAN-first segment and DreamView commands.
+    /// Values: disabled, iot, platform. Defaults to disabled.
+    /// You may also set GOVEE_LAN_CLOUD_FALLBACK via the environment.
+    #[arg(long, global = true, value_enum)]
+    lan_cloud_fallback: Option<CloudFallbackTransport>,
 }
 
 pub fn truthy(s: &str) -> anyhow::Result<bool> {
@@ -105,6 +145,17 @@ pub fn truthy(s: &str) -> anyhow::Result<bool> {
 }
 
 impl LanDiscoArguments {
+    pub fn cloud_fallback_transport(&self) -> anyhow::Result<CloudFallbackTransport> {
+        if let Some(transport) = self.lan_cloud_fallback {
+            return Ok(transport);
+        }
+
+        match opt_env_var::<String>("GOVEE_LAN_CLOUD_FALLBACK")? {
+            Some(value) => CloudFallbackTransport::parse_config(&value),
+            None => Ok(CloudFallbackTransport::Disabled),
+        }
+    }
+
     pub fn to_disco_options(&self) -> anyhow::Result<DiscoOptions> {
         let mut scan_names = self.scan.clone();
         let mut options = DiscoOptions {
@@ -558,24 +609,14 @@ impl LanDevice {
         g: u8,
         b: u8,
     ) -> anyhow::Result<()> {
-        let mask: u16 = 1u16.checked_shl(segment).unwrap_or(0);
-        let bytes = Base64HexBytes::with_bytes(vec![
-            0x33,
-            0x05,
-            0x15,
-            0x01,
-            r,
-            g,
-            b,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            (mask & 0xff) as u8,
-            (mask >> 8) as u8,
-        ]);
-        self.send_real(bytes.base64()).await
+        self.send_real(segment_color_ptreal_commands(segment, r, g, b))
+            .await
+    }
+
+    /// Toggle hardware DreamView/video mode over LAN `ptReal`.
+    /// Packet layout: 33 05 04 ENABLED 00...00 XOR.
+    pub async fn send_dreamview(&self, enabled: bool) -> anyhow::Result<()> {
+        self.send_real(dreamview_ptreal_commands(enabled)).await
     }
 
     pub async fn send_real(&self, commands: Vec<String>) -> anyhow::Result<()> {
@@ -616,6 +657,31 @@ impl LanDevice {
 
         anyhow::bail!("unable to set scene {scene_name} for {}", self.device);
     }
+}
+
+pub(crate) fn segment_color_ptreal_commands(segment: u32, r: u8, g: u8, b: u8) -> Vec<String> {
+    let mask: u16 = 1u16.checked_shl(segment).unwrap_or(0);
+    Base64HexBytes::with_bytes(vec![
+        0x33,
+        0x05,
+        0x15,
+        0x01,
+        r,
+        g,
+        b,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        (mask & 0xff) as u8,
+        (mask >> 8) as u8,
+    ])
+    .base64()
+}
+
+pub(crate) fn dreamview_ptreal_commands(enabled: bool) -> Vec<String> {
+    Base64HexBytes::with_bytes(vec![0x33, 0x05, 0x04, u8::from(enabled)]).base64()
 }
 
 pub fn boolean_int<'de, D: serde::de::Deserializer<'de>>(
@@ -1168,6 +1234,7 @@ mod tests {
             lan_query_backoff_ms: backoff_ms,
             lan_breaker_threshold: threshold,
             lan_breaker_cooldown: cooldown,
+            lan_cloud_fallback: None,
         }
     }
 
@@ -1188,6 +1255,7 @@ mod tests {
             "GOVEE_LAN_BROADCAST_ALL",
             "GOVEE_LAN_BROADCAST_GLOBAL",
             "GOVEE_LAN_SCAN",
+            "GOVEE_LAN_CLOUD_FALLBACK",
         ] {
             std::env::remove_var(var);
         }
@@ -1224,6 +1292,41 @@ mod tests {
             "saturates, not truncates"
         );
         assert_eq!(options.breaker.base_cooldown, 120 * SEC);
+
+        let mut args = disco_args(3, 350, 3, 300);
+        assert_eq!(
+            args.cloud_fallback_transport().expect("default fallback"),
+            CloudFallbackTransport::Disabled
+        );
+
+        std::env::set_var("GOVEE_LAN_CLOUD_FALLBACK", "iot");
+        assert_eq!(
+            args.cloud_fallback_transport().expect("env fallback"),
+            CloudFallbackTransport::Iot
+        );
+        args.lan_cloud_fallback = Some(CloudFallbackTransport::Platform);
+        assert_eq!(
+            args.cloud_fallback_transport().expect("CLI fallback"),
+            CloudFallbackTransport::Platform,
+            "an explicit CLI value must beat the environment"
+        );
+        std::env::remove_var("GOVEE_LAN_CLOUD_FALLBACK");
+    }
+
+    #[test]
+    fn dreamview_packet_matches_verified_ptreal_layout() {
+        for (enabled, expected_flag, expected_checksum) in [(false, 0x00, 0x32), (true, 0x01, 0x33)]
+        {
+            let commands = dreamview_ptreal_commands(enabled);
+            assert_eq!(commands.len(), 1);
+            let packet = data_encoding::BASE64
+                .decode(commands[0].as_bytes())
+                .expect("base64 packet");
+            assert_eq!(packet.len(), 20);
+            assert_eq!(&packet[..4], &[0x33, 0x05, 0x04, expected_flag]);
+            assert!(packet[4..19].iter().all(|byte| *byte == 0));
+            assert_eq!(packet[19], expected_checksum);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 name: Govee to MQTT Bridge
 image: ghcr.io/serjeleone/{arch}-govee2mqtt-addon
-version: "2026-08-24"
+version: "2026-08-25"
 slug: govee2mqtt-lite
 description: Control Govee Devices
 url: https://github.com/serjeleone/govee2mqtt
@@ -29,6 +29,8 @@ map:
 
 options:
   temperature_scale: "C"
+  # Segment and DreamView commands always try LAN first. Cloud use is opt-in.
+  lan_cloud_fallback: "disabled"
 
 schema:
   temperature_scale: "str?"
@@ -50,6 +52,7 @@ schema:
   lan_query_backoff_ms: "int(1,3000)?"
   lan_breaker_threshold: "int(0,)?"
   lan_breaker_cooldown: "int(30,900)?"
+  lan_cloud_fallback: "list(disabled|iot|platform)"
   disable_effects: "bool?"
   allowed_effects: "str?"
   # Override the Govee Home app version string sent in API headers.

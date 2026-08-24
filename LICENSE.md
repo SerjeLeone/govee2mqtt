@@ -2,6 +2,8 @@ MIT License
 
 Copyright (c) 2024-Present Wez Furlong
 Copyright (c) 2026 Sergey Leonov
+Copyright (c) 2021 Florian Lagg (@LaggAt)
+Copyright (c) 2025-2026 Tom Lasswell (@lasswellt)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
