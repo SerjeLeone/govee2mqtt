@@ -190,7 +190,7 @@ async fn mqtt_lifecycle_publishes_bridge_info_and_availability() {
         .expect("publish bridge info");
 
     // 3. Publish bridge health
-    state.publish_bridge_health().await;
+    govee::service::ext_health::publish_bridge_health(&state).await;
 
     // Give messages time to arrive
     let messages = collect_messages(subscriber, Duration::from_secs(2)).await;

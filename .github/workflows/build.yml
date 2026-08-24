@@ -1,215 +1,340 @@
-name: Container Build
+name: Verify, build and publish
 
 on:
+  release:
+    types:
+      - published
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
-  push:
-    tags:
-      - "20*"
-    branches:
-      - main
-    paths:
-      - "**/*.rs"
-      - "addon/**"
-      - "**/Cargo.*"
-      - ".github/workflows/build.yml"
-      - ".cargo/config.toml"
-      - "scripts/build-cross.sh"
-      - "scripts/build-docker.sh"
-      - "Dockerfile"
-      - ".dockerignore"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/serjeleone/govee2mqtt
+  REGISTRY: ghcr.io
+  STANDALONE_IMAGE: ghcr.io/${{ github.repository }}
+  SOURCE_URL: https://github.com/${{ github.repository }}
+  ADDON_IMAGE_NAME: ${{ github.event.repository.name }}-addon
+  ADDON_BASE_IDENTITY: https://github.com/home-assistant/docker-base/.*
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  initialize:
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      architectures: ${{ steps.metadata.outputs.architectures }}
+      matrix: ${{ steps.enrich-matrix.outputs.matrix }}
+      version: ${{ steps.metadata.outputs.version }}
+      addon_name: ${{ steps.metadata.outputs.addon_name }}
+      addon_description: ${{ steps.metadata.outputs.addon_description }}
+      addon_url: ${{ steps.metadata.outputs.addon_url }}
+    steps:
+      - name: Check out the requested revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          persist-credentials: false
+
+      - name: Validate repository metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+        run: ./scripts/ci-metadata.sh
+
+      - name: Prepare Home Assistant architecture matrix
+        id: ha-matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.06.0
+        with:
+          architectures: ${{ steps.metadata.outputs.architectures }}
+          image-name: ${{ env.ADDON_IMAGE_NAME }}
+
+      - name: Add build metadata to matrix
+        id: enrich-matrix
+        env:
+          MATRIX: ${{ steps.ha-matrix.outputs.matrix }}
+          BASE_IMAGES: ${{ steps.metadata.outputs.base_images }}
+          PLATFORMS: ${{ steps.metadata.outputs.platforms }}
+        run: |
+          matrix="$(
+            jq -c \
+              --argjson base_images "$BASE_IMAGES" \
+              --argjson platforms "$PLATFORMS" \
+              '.include |= map(. + {
+                base_image: $base_images[.arch],
+                platform: $platforms[.arch]
+              })' <<< "$MATRIX"
+          )"
+
+          if jq -e '.include[] | select(.base_image == null or .platform == null)' \
+            <<< "$matrix" >/dev/null; then
+            echo "::error::Architecture matrix is missing a base image or OCI platform"
+            exit 1
+          fi
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          jq . <<< "$matrix"
+
+  verify:
+    name: Verify source
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the requested revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        # Keep warnings visible without making future stable-toolchain lints
+        # break an otherwise valid release.
+        run: cargo +stable clippy --all-targets --all-features
+
+      - name: Build
+        run: cargo +stable build --all
+
+      - name: Run unit tests
+        run: cargo +stable test --lib -- --show-output
+
+      - name: Run LAN simulator tests
+        run: cargo +stable test --test lan_simulator -- --show-output
+
+      - name: Pull Mosquitto for integration tests
+        run: docker pull eclipse-mosquitto:2
+
+      - name: Run MQTT integration tests
+        run: cargo +stable test --test mqtt_integration -- --test-threads=1 --show-output
+
+  standalone:
+    name: Standalone ${{ matrix.arch }}
+    needs:
+      - initialize
+      - verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
+      matrix: ${{ fromJSON(needs.initialize.outputs.matrix) }}
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
-      - name: Docker meta
-        if: ${{ github.event_name != 'pull_request' }}
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Check out the requested revision
+        uses: actions/checkout@v6
         with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
-            type=ref,event=pr
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          persist-credentials: false
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to the Container registry
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/login-action@v3
-        with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: "Install Rust"
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: "Install cross from Cargo"
+
+      - name: Install cross
         uses: baptiste0928/cargo-install@v3
         with:
-          crate: "cross"
+          crate: cross
+
       - name: Build executable
-        run: ./scripts/build-cross.sh ${{ matrix.platform }}
-      - name: Build No Push
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: docker/build-push-action@v6
+        run: ./scripts/build-cross.sh "${{ matrix.platform }}"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'release'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test standalone image
+        if: github.event_name != 'release'
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: false
-      - name: Build and push by digest
-        if: ${{ github.event_name != 'pull_request' }}
-        id: build
-        uses: docker/build-push-action@v6
+          build-args: |
+            SOURCE_URL=${{ env.SOURCE_URL }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.initialize.outputs.version }}
+
+      - name: Build and push standalone image by digest
+        if: github.event_name == 'release'
+        id: publish
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          push: ${{ github.event_name != 'pull_request' }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          push: true
+          outputs: type=image,name=${{ env.STANDALONE_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            SOURCE_URL=${{ env.SOURCE_URL }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.initialize.outputs.version }}
+
       - name: Export digest
-        if: ${{ github.event_name != 'pull_request' }}
-        id: digest
+        if: github.event_name == 'release'
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-          echo "DIGEST_NAME=$(echo ${{ matrix.platform }} | sed 's,/,-,g')" >> $GITHUB_OUTPUT
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
       - name: Upload digest
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: actions/upload-artifact@v6
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v7
         with:
-          name: digest-${{ steps.digest.outputs.DIGEST_NAME }}
+          name: standalone-digest-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+  standalone-manifest:
+    name: Publish standalone manifest
+    if: github.event_name == 'release'
     needs:
-      - build
+      - initialize
+      - standalone
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
-          pattern: digest-*
+          pattern: standalone-digest-*
           merge-multiple: true
           path: /tmp/digests
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
         with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
-            type=ref,event=tag,enable=${{ github.ref_type == 'tag' }}
-            type=ref,event=pr
-      - name: Login to GHCR
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/login-action@v3
-        with:
-          registry: https://ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create manifest list and push
+
+      - name: Create manifest list
+        env:
+          IMAGE: ${{ env.STANDALONE_IMAGE }}
+          VERSION: ${{ needs.initialize.outputs.version }}
         working-directory: /tmp/digests
         run: |
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
           docker buildx imagetools create \
-            ${{ github.event_name == 'pull_request' && '--dry-run' || '' }} \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
-  addon:
-    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    runs-on: ubuntu-latest
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            "${sources[@]}"
+
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+  addon-test:
+    name: Test add-on ${{ matrix.arch }}
+    if: github.event_name != 'release'
     needs:
-      - merge
+      - initialize
+      - verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.initialize.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out the requested revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Test Home Assistant add-on image
+        uses: home-assistant/builder/actions/build-image@2026.06.0
+        with:
+          arch: ${{ matrix.arch }}
+          context: addon
+          image: ${{ matrix.image }}
+          image-tags: test
+          version: ${{ needs.initialize.outputs.version }}
+          push: "false"
+          cosign: "false"
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          build-args: |
+            BUILD_FROM=${{ matrix.base_image }}
+            GOVEE2MQTT_IMAGE=${{ env.STANDALONE_IMAGE }}:latest
+          labels: |
+            io.hass.type=addon
+            io.hass.name=${{ needs.initialize.outputs.addon_name }}
+            io.hass.description=${{ needs.initialize.outputs.addon_description }}
+            io.hass.url=${{ needs.initialize.outputs.addon_url }}
+            org.opencontainers.image.licenses=MIT
+
+  addon-publish:
+    name: Publish add-on ${{ matrix.arch }}
+    if: github.event_name == 'release'
+    needs:
+      - initialize
+      - standalone-manifest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.initialize.outputs.matrix) }}
     permissions:
       contents: read
       id-token: write
       packages: write
     steps:
-      - uses: actions/checkout@v6
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - name: Check out the release tag
+        uses: actions/checkout@v6
         with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Apply tag to version
-        run: ./scripts/apply-tag.sh
-      - name: Build and Publish Home Assistant Add On
-        uses: home-assistant/builder@2026.03.2
-        with:
-          args: |
-            --amd64 \
-            --aarch64 \
-            --cosign \
-            --target /data/addon
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
-  test-addon:
-    if: ${{ ! ( github.event_name == 'push' && github.ref_type == 'tag' ) }}
-    runs-on: ubuntu-latest
-    needs:
-      # Note! Despite the dependency edge here to the build steps above,
-      # this test-addon build flow will build the addon from the latest
-      # images that were published to ghcr.io, which is NOT the ones we
-      # build here because we don't push those when we trigger the conditions
-      # for this to build.
-      # Thats "OK" because the addon build doesn't actually run anything
-      # from that container image.
-      # The test-addon flow is validating that the addon build configuration
-      # looks plausible, so the prior image should be sufficient for that.
-      # If you are reading this and know how to get the bits above funnelled
-      # into the hass build below, and it isn't eye-bleedingly-gnarly, then
-      # please submit a PR!
-      - build
-    permissions:
-      contents: read
-      id-token: write
-      packages: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - name: Build, sign and publish Home Assistant add-on image
+        uses: home-assistant/builder/actions/build-image@2026.06.0
         with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Test Build Home Assistant Add On
-        uses: home-assistant/builder@2026.03.2
-        with:
-          args: |
-            --test \
-            --amd64 \
-            --aarch64 \
-            --cosign \
-            --target /data/addon
+          arch: ${{ matrix.arch }}
+          context: addon
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.initialize.outputs.version }}
+            latest
+          version: ${{ needs.initialize.outputs.version }}
+          push: "true"
+          cosign: "true"
+          cosign-base-verify: ${{ matrix.base_image }}
+          cosign-base-identity: ${{ env.ADDON_BASE_IDENTITY }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          build-args: |
+            BUILD_FROM=${{ matrix.base_image }}
+            GOVEE2MQTT_IMAGE=${{ env.STANDALONE_IMAGE }}:${{ needs.initialize.outputs.version }}
+          labels: |
+            io.hass.type=addon
+            io.hass.name=${{ needs.initialize.outputs.addon_name }}
+            io.hass.description=${{ needs.initialize.outputs.addon_description }}
+            io.hass.url=${{ needs.initialize.outputs.addon_url }}
+            org.opencontainers.image.licenses=MIT

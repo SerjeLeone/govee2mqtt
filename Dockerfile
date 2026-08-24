@@ -24,6 +24,8 @@ WORKDIR /data
 ####################################################################################################
 FROM gcr.io/distroless/cc-debian12
 
+ARG SOURCE_URL
+
 # Import from builder.
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
@@ -38,7 +40,7 @@ COPY assets /app/assets
 COPY scene-data /app/scene-data
 
 USER govee:govee
-LABEL org.opencontainers.image.source="https://github.com/serjeleone/govee2mqtt"
+LABEL org.opencontainers.image.source="$SOURCE_URL"
 ENV \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH \
@@ -51,5 +53,4 @@ CMD ["/app/govee", \
   "--govee-iot-key=/data/iot.key", \
   "--govee-iot-cert=/data/iot.cert", \
   "--amazon-root-ca=/app/AmazonRootCA1.pem"]
-
 

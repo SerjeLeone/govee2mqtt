@@ -1,4 +1,6 @@
 ARG BUILD_FROM
+# CI overrides this with the standalone image from the exact release tag.
+# The default keeps local Home Assistant builds usable outside GitHub Actions.
 ARG GOVEE2MQTT_IMAGE=ghcr.io/serjeleone/govee2mqtt:latest
 FROM ${GOVEE2MQTT_IMAGE} AS govee2mqtt
 FROM $BUILD_FROM

@@ -1,3 +1,8 @@
+> Fork maintained by [Sergey Leonov (@serjeleone)](https://github.com/serjeleone).
+> It is based on [sitapix/govee2mqtt](https://github.com/sitapix/govee2mqtt),
+> which derives from the original [wez/govee2mqtt](https://github.com/wez/govee2mqtt) project.
+> See [contributors and fork lineage](CONTRIBUTORS.md) for attribution details.
+
 # Govee to MQTT bridge for Home Assistant
 
 This repo provides a `govee` executable whose primary purpose is to act
@@ -142,19 +147,13 @@ Set `GOVEE_HTTP_AUTH_TOKEN` to require a Bearer token for API access (except `/a
 * [Is my device supported?](docs/SKUS.md)
 * [Check out the FAQ](docs/FAQ.md)
 
-## Want to show your support or gratitude?
+## Credits and attribution
 
-It takes significant effort to build, maintain and support users of software
-like this. If you can spare something to say thanks, it is appreciated!
+This fork is maintained by [Sergey Leonov (@serjeleone)](https://github.com/serjeleone)
+and retains the original authors and contributors in its Git history. See
+[CONTRIBUTORS.md](CONTRIBUTORS.md) for the complete fork lineage.
 
-* [Sponsor me on Github](https://github.com/sponsors/wez)
-* [Sponsor me on Patreon](https://patreon.com/WezFurlong)
-* [Sponsor me on Ko-Fi](https://ko-fi.com/wezfurlong)
-* [Sponsor me via liberapay](https://liberapay.com/wez)
-
-## Credits
-
-This work is based on my earlier work with [Govee LAN
+The original project builds on Wez Furlong's earlier work with [Govee LAN
 Control](https://github.com/wez/govee-lan-hass/).
 
 The AWS IoT support was made possible by the work of @bwp91 in
