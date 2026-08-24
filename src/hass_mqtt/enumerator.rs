@@ -1,6 +1,7 @@
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
 use crate::hass_mqtt::button::ButtonConfig;
 use crate::hass_mqtt::climate::TargetTemperatureEntity;
+use crate::hass_mqtt::fan::Fan;
 use crate::hass_mqtt::humidifier::Humidifier;
 use crate::hass_mqtt::instance::EntityList;
 use crate::hass_mqtt::light::DeviceLight;
@@ -9,7 +10,10 @@ use crate::hass_mqtt::scene::SceneConfig;
 use crate::hass_mqtt::select::{
     EnumCapabilitySelect, MusicModeSelect, SceneModeSelect, WorkModeSelect,
 };
-use crate::hass_mqtt::sensor::{CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic};
+use crate::hass_mqtt::sensor::{
+    CapabilitySensor, DeviceSettingDiagnostic, DeviceSettingField, DeviceStatusDiagnostic,
+    GlobalFixedDiagnostic, SceneInfoSensor,
+};
 use crate::hass_mqtt::switch::{CapabilitySwitch, MusicAutoColorSwitch};
 use crate::hass_mqtt::work_mode::ParsedWorkMode;
 use crate::platform_api::{DeviceCapability, DeviceCapabilityKind, DeviceType};
@@ -171,6 +175,22 @@ pub async fn enumerate_entities_for_device<'a>(
     entities.add(DeviceStatusDiagnostic::new(d, state));
     entities.add(ButtonConfig::request_platform_data_for_device(d));
 
+    if d.supports_rgb() || d.get_color_temperature_range().is_some() {
+        entities.add(ButtonConfig::scene_next_for_device(d));
+        entities.add(ButtonConfig::scene_prev_for_device(d));
+        entities.add(SceneInfoSensor::new(d, state));
+    }
+
+    // Battery / Wi-Fi signal diagnostics from the undoc device settings.
+    // `for_device` returns None when the device doesn't report a value, so
+    // lights don't get a bogus "Battery: N/A" entity.
+    if let Some(e) = DeviceSettingDiagnostic::for_device(d, state, DeviceSettingField::Battery) {
+        entities.add(e);
+    }
+    if let Some(e) = DeviceSettingDiagnostic::for_device(d, state, DeviceSettingField::WifiLevel) {
+        entities.add(e);
+    }
+
     if d.supports_rgb() || d.get_color_temperature_range().is_some() || d.supports_brightness() {
         entities.add(DeviceLight::for_device(&d, state, None).await?);
     } else if let DeviceType::Other(ref other) = d.device_type() {
@@ -187,6 +207,10 @@ pub async fn enumerate_entities_for_device<'a>(
         DeviceType::Humidifier | DeviceType::Dehumidifier
     ) {
         entities.add(Humidifier::new(&d, state).await?);
+    }
+
+    if d.device_type() == DeviceType::Fan {
+        entities.add(Fan::new(d, state).await?);
     }
 
     let mut has_dedicated_scene_controls = false;
@@ -236,7 +260,7 @@ pub async fn enumerate_entities_for_device<'a>(
                 DeviceCapabilityKind::TemperatureSetting => {
                     entities.add(TargetTemperatureEntity::new(&d, state, cap).await?);
                 }
-                
+
                 DeviceCapabilityKind::Other(ref s) if s == "devices.capabilities.movie_setting" => {
                     // Ignore movieMode capability (not yet supported)
                 }

@@ -63,12 +63,19 @@ export_config no_multicast      GOVEE_LAN_NO_MULTICAST
 export_config broadcast_all     GOVEE_LAN_BROADCAST_ALL
 export_config global_broadcast  GOVEE_LAN_BROADCAST_GLOBAL
 export_config scan              GOVEE_LAN_SCAN
+export_config lan_query_attempts GOVEE_LAN_QUERY_ATTEMPTS
+export_config lan_query_backoff_ms GOVEE_LAN_QUERY_BACKOFF_MS
+export_config lan_breaker_threshold GOVEE_LAN_BREAKER_THRESHOLD
+export_config lan_breaker_cooldown GOVEE_LAN_BREAKER_COOLDOWN
 export_config temperature_scale GOVEE_TEMPERATURE_SCALE
-export_config disable_effects   GOVEE_DISABLE_EFFECTS
-export_config allowed_effects   GOVEE_ALLOWED_EFFECTS
-export_config poll_interval     GOVEE_POLL_INTERVAL
+export_config disable_effects    GOVEE_DISABLE_EFFECTS
+export_config allowed_effects    GOVEE_ALLOWED_EFFECTS
+export_config govee_app_version  GOVEE_APP_VERSION
+export_config govee_2fa_code     GOVEE_2FA_CODE
+export_config music_palette      GOVEE_MUSIC_PALETTE
+export_config poll_interval      GOVEE_POLL_INTERVAL
 
-env | grep GOVEE_ | sed -r 's/_(EMAIL|KEY|PASSWORD)=.*/_\1=REDACTED/'
+env | grep GOVEE_ | sed -r 's/_(EMAIL|KEY|PASSWORD|2FA_CODE)=.*/_\1=REDACTED/'
 set -x
 
 cd /app

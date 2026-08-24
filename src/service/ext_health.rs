@@ -160,6 +160,7 @@ mod tests {
                 brightness: 100,
                 color: DeviceColor { r: 255, g: 0, b: 0 },
                 color_temperature_kelvin: 0,
+                mode: None,
             });
         }
         {
@@ -169,6 +170,7 @@ mod tests {
                 brightness: 0,
                 color: DeviceColor { r: 0, g: 0, b: 0 },
                 color_temperature_kelvin: 0,
+                mode: None,
             });
         }
 

@@ -132,7 +132,7 @@ export class DeviceList extends LitElement {
 
   _render_detail = (item) => {
     const data = this.inspectCache[item.safe_id];
-    if (!data) return html`<tr><td colspan="5"><div class="text-center py-3"><div class="spinner-border spinner-border-sm"></div></div></td></tr>`;
+    if (!data) return html`<tr><td colspan="3"><div class="text-center py-3"><div class="spinner-border spinner-border-sm"></div></div></td></tr>`;
 
     const stateJson = data.current_state
       ? JSON.stringify(data.current_state, null, 2)
@@ -144,7 +144,7 @@ export class DeviceList extends LitElement {
 
     return html`
       <tr class="gv-detail-panel">
-        <td colspan="5" class="p-0">
+        <td colspan="3" class="p-0">
           <div class="card border-0 bg-body-tertiary m-2">
             <div class="card-body">
               <div class="row g-3">
@@ -197,6 +197,35 @@ export class DeviceList extends LitElement {
     `;
   }
 
+  _render_badge(label, active, activeClass = 'text-bg-info') {
+    if (active === undefined || active === null) {
+      return html`<span class="badge rounded-pill text-bg-secondary">${label}: unknown</span>`;
+    }
+    return html`<span class="badge rounded-pill ${active ? activeClass : 'text-bg-secondary'}">${label}</span>`;
+  }
+
+  _status_summary(devices) {
+    const mqttConfigured = devices.some((item) => item.mqtt_configured);
+    const apiCount = devices.filter((item) => item.api_metadata).length;
+    const lanCount = devices.filter((item) => item.lan_discovered).length;
+    return html`
+      <div class="device-status-summary mb-3">
+        ${this._render_badge('MQTT configured', mqttConfigured)}
+        <span class="badge rounded-pill text-bg-info">API metadata: ${apiCount}</span>
+        <span class="badge rounded-pill text-bg-info">LAN discovered: ${lanCount}</span>
+      </div>`;
+  }
+
+  _room_groups(devices) {
+    const groups = new Map();
+    for (const item of devices) {
+      const room = item.room || 'Unassigned';
+      if (!groups.has(room)) groups.set(room, []);
+      groups.get(room).push(item);
+    }
+    return [...groups.entries()];
+  }
+
   _render_item = (item) => {
     const hasState = !!item.state;
     const isOn = item.state?.on ?? false;
@@ -221,6 +250,19 @@ export class DeviceList extends LitElement {
           <span class="gv-status-dot ${hasState ? 'online' : 'offline'}"></span>
           <strong>${item.name}</strong>
           ${item.room ? html`<br><small class="text-muted">${item.room}</small>` : ''}
+          <div class="d-flex flex-wrap gap-1 mt-1">
+            ${this._render_badge('API', item.api_metadata)}
+            ${this._render_badge('LAN', item.lan_discovered)}
+            ${this._render_badge(
+              item.cloud_online == null
+                ? 'Cloud'
+                : item.cloud_online
+                  ? 'Cloud online'
+                  : 'Cloud offline',
+              item.cloud_online,
+              'text-bg-success'
+            )}
+          </div>
         </td>
         <td class="gv-device-controls" @click=${(e) => e.stopPropagation()}>
           <div class="d-flex align-items-center gap-2 flex-wrap">
@@ -269,20 +311,25 @@ export class DeviceList extends LitElement {
     }
 
     return html`
-      <div class="gv-table-wrap">
-        <table class="table table-hover align-middle mb-2">
-          <thead>
-            <tr>
-              <th>Device</th>
-              <th>Controls</th>
-              <th class="text-end d-none d-md-table-cell">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${devices.map(this._render_item)}
-          </tbody>
-        </table>
-      </div>
+      ${this._status_summary(devices)}
+      ${this._room_groups(devices).map(([room, items]) => html`
+        <section class="device-room-section mb-4">
+          <h2>${room}</h2>
+          <div class="gv-table-wrap">
+            <table class="table table-hover align-middle mb-2">
+              <thead>
+                <tr>
+                  <th>Device</th>
+                  <th>Controls</th>
+                  <th class="text-end d-none d-md-table-cell">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${items.map(this._render_item)}
+              </tbody>
+            </table>
+          </div>
+        </section>`)}
       <small class="text-muted">${devices.length} device${devices.length !== 1 ? 's' : ''}. Click a row for details.</small>`;
   }
 }

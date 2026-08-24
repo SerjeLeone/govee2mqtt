@@ -2,6 +2,7 @@ pub mod base;
 pub mod button;
 pub mod climate;
 pub mod enumerator;
+pub mod fan;
 pub mod group_light;
 pub mod humidifier;
 pub mod instance;

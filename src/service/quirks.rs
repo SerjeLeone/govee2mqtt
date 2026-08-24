@@ -94,6 +94,10 @@ impl Quirk {
         Self::device(sku, DeviceType::Thermometer, "mdi:thermometer")
     }
 
+    pub fn air_quality_monitor<SKU: Into<Cow<'static, str>>>(sku: SKU) -> Self {
+        Self::device(sku, DeviceType::AirQualityMonitor, "mdi:molecule-co2")
+    }
+
     pub fn with_rgb(mut self) -> Self {
         self.supports_rgb = true;
         self
@@ -234,7 +238,10 @@ fn load_external_quirks(map: &mut HashMap<String, Quirk>) {
     let externals: Vec<ExternalQuirk> = match serde_json::from_str(&data) {
         Ok(v) => v,
         Err(err) => {
-            log::error!("Failed to parse external quirks {}: {err:#}", path.display());
+            log::error!(
+                "Failed to parse external quirks {}: {err:#}",
+                path.display()
+            );
             return;
         }
     };
@@ -308,6 +315,10 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::light("H6159", STRIP).with_broken_platform(),
         // <https://github.com/wez/govee2mqtt/issues/152>
         Quirk::light("H6003", BULB).with_broken_platform(),
+        // H6006 WiFi bulbs supports IoT but lacks a quirk; without it, commands
+        // route through the rate-limited Platform API (10-15s delays).
+        // <https://github.com/wez/govee2mqtt/issues/621>
+        Quirk::light("H6006", BULB).with_iot_api_support(true),
         // <https://github.com/wez/govee2mqtt/issues/40#issuecomment-1889726710>
         // indicates that this one doesn't work like the others with IoT
         Quirk::light("H6121", STRIP).with_iot_api_support(false),
@@ -411,11 +422,13 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H6066", HEX),
         Quirk::lan_api_capable_light("H6067", TRIANGLE),
         Quirk::lan_api_capable_light("H6073", FLOOR_LAMP),
-        Quirk::lan_api_capable_light("H6076", FLOOR_LAMP),
+        // Color temp clamp: API reports 2000-9009K but real range is 2700-6500K
+        // <https://github.com/wez/govee2mqtt/issues/591>
+        Quirk::lan_api_capable_light("H6076", FLOOR_LAMP).with_color_temp_range(2700, 6500),
         Quirk::lan_api_capable_light("H6078", FLOOR_LAMP),
         Quirk::lan_api_capable_light("H6087", WALL_SCONCE),
-        // Neon Rope Light 2, LAN-capable (from homeassilol fork)
-        Quirk::lan_api_capable_light("H60B0", STRIP),
+        // H60B0 Uplighter, LAN-capable.
+        Quirk::lan_api_capable_light("H60B0", FLOOR_LAMP),
         Quirk::lan_api_capable_light("H610A", STRIP),
         Quirk::lan_api_capable_light("H610B", STRIP),
         Quirk::lan_api_capable_light("H6117", STRIP),
@@ -441,6 +454,10 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H61A9", STRIP),
         Quirk::lan_api_capable_light("H61B2", TV_BACK),
         Quirk::lan_api_capable_light("H61E1", STRIP),
+        // COB Strip Light Pro 9.8ft — color temp 2700-6500K (API reports 2000-9000K).
+        // Segment count over-reported (16) vs actual (12); leaving segments alone since
+        // the user notes extras can be ignored. <https://github.com/wez/govee2mqtt/issues/567>
+        Quirk::lan_api_capable_light("H61E5", STRIP).with_color_temp_range(2700, 6500),
         Quirk::lan_api_capable_light("H66A1", TV_BACK),
         Quirk::lan_api_capable_light("H7012", STRING),
         Quirk::lan_api_capable_light("H7013", STRING),
@@ -462,6 +479,59 @@ fn load_quirks() -> HashMap<String, Quirk> {
         Quirk::lan_api_capable_light("H7061", FLOOD),
         Quirk::lan_api_capable_light("H7062", FLOOD),
         Quirk::lan_api_capable_light("H7065", SPOTLIGHT),
+        // Outdoor strip 2 x 7.5m RGBIC — <https://github.com/wez/govee2mqtt/issues/577>
+        Quirk::lan_api_capable_light("H616D", STRIP),
+        // Wall sconce, LAN-capable — <https://github.com/wez/govee2mqtt/issues/605>
+        Quirk::lan_api_capable_light("H6039", WALL_SCONCE),
+        // H5140 Smart CO₂ Monitor — reports as devices.types.air_quality_monitor
+        // with carbonDioxideConcentration / sensorTemperature / sensorHumidity.
+        // <https://github.com/wez/govee2mqtt/issues/634>
+        Quirk::air_quality_monitor("H5140")
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit)
+            .with_platform_humidity_sensor_units(HumidityUnits::RelativePercent)
+            .with_iot_api_support(true),
+        // H5106 BLE-only air quality monitor. <https://github.com/wez/govee2mqtt/issues/561>
+        Quirk::air_quality_monitor("H5106")
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit)
+            .with_platform_humidity_sensor_units(HumidityUnits::RelativePercent)
+            .with_ble_only(true)
+            .with_iot_api_support(true),
+        // BLE-only LED strips — without a BLE ingest path we can't drive
+        // them, but classifying them as lights silences the "unknown device
+        // type" warnings users see in logs. If/when BLE control lands,
+        // these already report the right capabilities.
+        // <https://github.com/wez/govee2mqtt/issues/569> H6125_5321
+        // <https://github.com/wez/govee2mqtt/issues/630> H6125_321A
+        Quirk::light("H6125_321A", STRIP)
+            .with_broken_platform()
+            .with_ble_only(true),
+        Quirk::light("H6125_5321", STRIP)
+            .with_broken_platform()
+            .with_ble_only(true),
+        // H5129 outdoor motion sensor — BLE only. Same caveat as the
+        // strips above: classified correctly but not controllable until
+        // a BLE path exists. <https://github.com/wez/govee2mqtt/issues/580>
+        Quirk::device("H5129", DeviceType::Sensor, "mdi:motion-sensor").with_ble_only(true),
+        // Meat thermometers (BLE-only). Mapping them keeps the log clean
+        // and establishes the right icon; real values require BLE ingest.
+        Quirk::thermometer("H5181")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
+        Quirk::thermometer("H5182")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
+        Quirk::thermometer("H5183")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
+        Quirk::thermometer("H5184")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
+        Quirk::thermometer("H5185")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
+        Quirk::thermometer("H5198")
+            .with_ble_only(true)
+            .with_platform_temperature_sensor_units(TemperatureUnits::Fahrenheit),
     ] {
         map.insert(quirk.sku.to_string(), quirk);
     }

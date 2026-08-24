@@ -2,18 +2,45 @@ use crate::ble::{Base64HexBytes, GoveeBlePacket, HumidifierAutoMode, NotifyHumid
 use crate::lan_api::{DeviceColor, DeviceStatus};
 use crate::platform_api::from_json;
 use crate::service::state::StateHandle;
-use crate::undoc_api::{ms_timestamp, DeviceEntry, LoginAccountResponse, ParsedOneClick};
+use crate::undoc_api::{DeviceEntry, LoginAccountResponse, ParsedOneClick};
 use crate::UndocApiArguments;
 use anyhow::Context;
 use async_channel::Receiver;
+use chrono::Utc;
 use mosquitto_rs::{Event, QoS};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
 #[derive(Clone)]
 pub struct IotClient {
     client: mosquitto_rs::Client,
+}
+
+/// Transaction IDs are the dedupe key on Govee's IoT side — always freshly
+/// minted so replays don't silently drop.
+static LAST_TRANSACTION: AtomicU64 = AtomicU64::new(0);
+
+fn new_transaction() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix epoch in the past")
+        .as_micros() as u64;
+    let mut previous = LAST_TRANSACTION.load(Ordering::Relaxed);
+    let value = loop {
+        let candidate = now.max(previous.saturating_add(1));
+        match LAST_TRANSACTION.compare_exchange_weak(
+            previous,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break candidate,
+            Err(actual) => previous = actual,
+        }
+    };
+    format!("v_{value}")
 }
 
 impl IotClient {
@@ -31,7 +58,7 @@ impl IotClient {
                     "msg": {
                         "cmd": "status",
                         "cmdVersion": 2,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 0,
                     }
                 }))?,
@@ -70,7 +97,7 @@ impl IotClient {
                             "val": power_state,
                         },
                         "cmdVersion": 0,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 1,
                     }
                 }))?,
@@ -95,7 +122,7 @@ impl IotClient {
                             "val": percent,
                         },
                         "cmdVersion": 0,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 1,
                     }
                 }))?,
@@ -130,7 +157,7 @@ impl IotClient {
                             "colorTemInKelvin": kelvin,
                         },
                         "cmdVersion": 0,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 1,
                     }
                 }))?,
@@ -167,7 +194,7 @@ impl IotClient {
                             "colorTemInKelvin": 0,
                         },
                         "cmdVersion": 0,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 1,
                     }
                 }))?,
@@ -197,7 +224,7 @@ impl IotClient {
                             "command": commands,
                         },
                         "cmdVersion": 0,
-                        "transaction": format!("v_{}000", ms_timestamp()),
+                        "transaction": new_transaction(),
                         "type": 1,
                     }
                 }))?,
@@ -212,10 +239,13 @@ impl IotClient {
     pub async fn activate_one_click(&self, item: &ParsedOneClick) -> anyhow::Result<()> {
         for entry in &item.entries {
             for command in &entry.msgs {
+                // Govee IoT dedupes on transaction; reusing a cached TX
+                // from the fetched rule silently drops the publish (#635).
+                let command = refresh_transaction(command);
                 self.client
                     .publish(
                         entry.topic.as_str(),
-                        serde_json::to_string(command)?,
+                        serde_json::to_string(command.as_ref())?,
                         QoS::AtMostOnce,
                         false,
                     )
@@ -224,6 +254,113 @@ impl IotClient {
             }
         }
         Ok(())
+    }
+}
+
+/// Returns the value borrowed when there is no string `transaction` field
+/// anywhere in the tree; otherwise returns an owned clone with those fields
+/// rewritten to fresh IDs.
+fn refresh_transaction(value: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+    if !has_string_transaction(value) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut cloned = value.clone();
+    rewrite_transaction_in_place(&mut cloned);
+    std::borrow::Cow::Owned(cloned)
+}
+
+fn has_string_transaction(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("transaction").is_some_and(|v| v.is_string()) {
+                return true;
+            }
+            map.values().any(has_string_transaction)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(has_string_transaction),
+        _ => false,
+    }
+}
+
+fn rewrite_transaction_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "transaction" {
+                    if v.is_string() {
+                        *v = serde_json::Value::String(new_transaction());
+                    }
+                    continue;
+                }
+                rewrite_transaction_in_place(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_transaction_in_place(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn refresh_transaction_rewrites_top_level() {
+        let input = json!({
+            "topic": "GA/abc",
+            "transaction": "v_OLD",
+            "other": 1,
+        });
+        let out = refresh_transaction(&input);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        let tx = out.get("transaction").and_then(|v| v.as_str()).unwrap();
+        assert!(tx.starts_with("v_") && tx != "v_OLD");
+        assert_eq!(out.get("other").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn refresh_transaction_rewrites_nested() {
+        let input = json!({
+            "msg": {
+                "transaction": "v_OLD",
+                "data": { "value": 1 }
+            }
+        });
+        let out = refresh_transaction(&input);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        let tx = out
+            .pointer("/msg/transaction")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(tx.starts_with("v_") && tx != "v_OLD");
+    }
+
+    #[test]
+    fn refresh_transaction_leaves_non_string_transaction_alone() {
+        let input = json!({ "transaction": 42 });
+        let out = refresh_transaction(&input);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.get("transaction").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn refresh_transaction_borrows_when_no_tx_field() {
+        let input = json!({ "msg": { "cmd": "turn", "data": { "val": 1 } } });
+        let out = refresh_transaction(&input);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn transaction_ids_are_unique_even_within_one_clock_tick() {
+        let first = new_transaction();
+        let second = new_transaction();
+        assert_ne!(first, second);
+        assert!(first.starts_with("v_") && second.starts_with("v_"));
     }
 }
 
@@ -326,6 +463,10 @@ struct StateUpdate {
     pub color: Option<DeviceColor>,
     #[serde(rename = "colorTemInKelvin")]
     pub color_temperature_kelvin: Option<u32>,
+    /// Active work mode number, present in `cmd:"status"` messages
+    /// from (at least) light devices. SKU-specific meaning.
+    #[serde(default)]
+    pub mode: Option<i64>,
     pub sku: Option<String>,
     pub device: Option<String>,
 }
@@ -396,6 +537,7 @@ async fn run_iot_subscriber(
                                             brightness: state.brightness,
                                             color: state.color,
                                             color_temperature_kelvin: state.kelvin,
+                                            mode: state.mode,
                                         },
                                         None => DeviceStatus::default(),
                                     },
@@ -412,6 +554,10 @@ async fn run_iot_subscriber(
                                 if let Some(v) = packet.state.color_temperature_kelvin {
                                     state.color_temperature_kelvin = v;
                                     state.on = true;
+                                }
+                                if let Some(v) = packet.state.mode {
+                                    state.mode = Some(v);
+                                    device.last_iot_mode_update = Some(Utc::now());
                                 }
 
                                 if let Some(op) = &packet.op {

@@ -1,4 +1,6 @@
-use crate::ble::{Base64HexBytes, SetHumidifierMode, SetHumidifierNightlightParams};
+use crate::ble::{
+    Base64HexBytes, SetHumidifierMode, SetHumidifierNightlightParams, SetMusicPalette,
+};
 use crate::lan_api::{Client as LanClient, DeviceStatus as LanDeviceStatus, LanDevice};
 use crate::platform_api::{DeviceCapability, DeviceType, GoveeApiClient, HttpRequestFailed};
 use crate::service::coordinator::Coordinator;
@@ -8,12 +10,35 @@ use crate::service::iot::IotClient;
 use crate::temperature::{TemperatureScale, TemperatureValue};
 use crate::undoc_api::{GoveeUndocumentedApi, LightEffectCategory};
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, Semaphore};
 use tokio::time::{sleep, Duration};
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SceneCatalogCategory {
+    pub name: String,
+    pub scenes: Vec<SceneCatalogEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SceneCatalogCache {
+    /// Fingerprint of the Platform API metadata used to build the catalog.
+    /// A catalog fetched before that metadata arrives is refreshed once it does.
+    pub platform_signature: Option<String>,
+    pub categories: Vec<SceneCatalogCategory>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SceneCatalogEntry {
+    pub name: String,
+    pub icon_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
 
 pub struct State {
     devices_by_id: Mutex<HashMap<String, Device>>,
@@ -400,12 +425,22 @@ impl State {
             log::info!("Using LAN API to set {device} light power state");
             lan_dev.send_turn(on).await?;
             self.poll_lan_api(lan_dev, |status| status.on == on).await?;
+            if !on {
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(None);
+            }
             return Ok(());
         }
 
         if let Some((iot, entry)) = self.iot_for_device(device).await {
             log::info!("Using IoT API to set {device} light power state");
             iot.set_power_state(entry, on).await?;
+            if !on {
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(None);
+            }
             return Ok(());
         }
 
@@ -413,6 +448,11 @@ impl State {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} light {instance_name} state");
                 client.set_toggle_state(info, instance_name, on).await?;
+                if !on {
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene(None);
+                }
                 return Ok(());
             }
         }
@@ -429,12 +469,22 @@ impl State {
             log::info!("Using LAN API to set {device} power state");
             lan_dev.send_turn(on).await?;
             self.poll_lan_api(lan_dev, |status| status.on == on).await?;
+            if !on {
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(None);
+            }
             return Ok(());
         }
 
         if let Some((iot, entry)) = self.iot_for_device(device).await {
             log::info!("Using IoT API to set {device} power state");
             iot.set_power_state(entry, on).await?;
+            if !on {
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .set_active_scene(None);
+            }
             return Ok(());
         }
 
@@ -442,6 +492,11 @@ impl State {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} power state");
                 client.set_power_state(info, on).await?;
+                if !on {
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene(None);
+                }
                 return Ok(());
             }
         }
@@ -507,6 +562,9 @@ impl State {
         if let Some((iot, entry)) = self.iot_for_device(device).await {
             log::info!("Using IoT API to set {device} color temperature");
             iot.set_color_temperature(entry, kelvin).await?;
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_active_scene(None);
             return Ok(());
         }
 
@@ -610,6 +668,9 @@ impl State {
         if let Some((iot, entry)) = self.iot_for_device(device).await {
             log::info!("Using IoT API to set {device} color");
             iot.set_color_rgb(entry, r, g, b).await?;
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_active_scene(None);
             return Ok(());
         }
 
@@ -653,14 +714,74 @@ impl State {
     }
 
     pub async fn device_list_scenes(&self, device: &Device) -> anyhow::Result<Vec<String>> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
-        let mut platform_scenes = vec![];
-        let mut undoc_scenes = vec![];
+        let catalog = self.device_list_scenes_categorized(device).await?;
+        Ok(sort_and_dedup_scenes(
+            catalog
+                .into_iter()
+                .flat_map(|category| category.scenes.into_iter().map(|scene| scene.name))
+                .collect(),
+        ))
+    }
+
+    /// Clears every device's in-memory scene catalog. The MQTT cache-purge
+    /// controls clear both this cache and the on-disk API cache.
+    pub async fn clear_scene_catalogs(&self) {
+        for device in self.devices_by_id.lock().await.values_mut() {
+            device.clear_scene_catalog();
+        }
+    }
+
+    /// Returns the merged scene catalog while preserving Govee's categories,
+    /// thumbnails and hints. Platform-only and decoded-database scenes are kept
+    /// in an additional category, so no control path loses scenes supplied by
+    /// another source.
+    pub async fn device_list_scenes_categorized(
+        &self,
+        device: &Device,
+    ) -> anyhow::Result<Vec<SceneCatalogCategory>> {
+        let device = self
+            .device_by_id(&device.id)
+            .await
+            .unwrap_or_else(|| device.clone());
+        let cached = device.scene_catalog_cache().cloned();
+
+        if let Some(cached) = &cached {
+            if !self.should_refresh_scene_catalog(&device, cached).await {
+                return Ok(cached.categories.clone());
+            }
+        }
+
+        let mut catalog = self.fetch_scene_catalog(&device).await;
+        if catalog.categories.is_empty() {
+            if let Some(cached) = &cached {
+                if !cached.categories.is_empty() {
+                    log::warn!(
+                        "Scene catalog refresh returned no scenes for {device}; using cached catalog"
+                    );
+                    catalog.categories = cached.categories.clone();
+                }
+            }
+        }
+
+        // Do not pin a device to an empty result: its cloud metadata may not
+        // have arrived yet and a later registration should retry the lookup.
+        if !catalog.categories.is_empty() {
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_scene_catalog(catalog.clone());
+        }
+
+        Ok(catalog.categories)
+    }
+
+    async fn fetch_scene_catalog(&self, device: &Device) -> SceneCatalogCache {
+        let platform_signature = scene_platform_signature(device);
+        let mut platform_names = vec![];
 
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 match client.list_scene_names(info).await {
-                    Ok(names) => platform_scenes.extend(names),
+                    Ok(names) => platform_names = sort_and_dedup_scenes(names),
                     Err(err) => {
                         log::warn!("Unable to list Platform API scenes for {device}: {err:#}");
                     }
@@ -668,34 +789,40 @@ impl State {
             }
         }
 
-        match GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await {
-            Ok(categories) => undoc_scenes.extend(scene_names_from_undoc_categories(categories)),
+        let undoc_categories = match GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await
+        {
+            Ok(categories) => categories,
             Err(err) => {
                 log::trace!("Undocumented scene catalog unavailable for {device}: {err:#}");
+                vec![]
             }
-        }
+        };
 
-        let mut scenes = merge_scene_name_sources(platform_scenes, undoc_scenes);
+        let decoded_names = crate::service::scene_database::scene_names_for_sku(&device.sku);
+        let categories =
+            merge_scene_catalog_sources(undoc_categories, platform_names, decoded_names);
 
-        // Merge decoded scene database (AlgoClaw) as additional source
-        let decoded_names =
-            crate::service::scene_database::scene_names_for_sku(&device.sku);
-        if !decoded_names.is_empty() {
-            let existing_lower: std::collections::HashSet<String> =
-                scenes.iter().map(|s| s.to_ascii_lowercase()).collect();
-            for name in decoded_names {
-                if !existing_lower.contains(&name.to_ascii_lowercase()) {
-                    scenes.push(name);
-                }
-            }
-            scenes = sort_and_dedup_scenes(scenes);
-        }
-
-        if scenes.is_empty() {
+        if categories.is_empty() {
             log::trace!("No scene data available for {device} from any source");
         }
 
-        Ok(scenes)
+        SceneCatalogCache {
+            platform_signature,
+            categories,
+        }
+    }
+
+    async fn should_refresh_scene_catalog(
+        &self,
+        device: &Device,
+        cache: &SceneCatalogCache,
+    ) -> bool {
+        if self.get_platform_client().await.is_none() {
+            return false;
+        }
+
+        let current_signature = scene_platform_signature(device);
+        current_signature.is_some() && current_signature != cache.platform_signature
     }
 
     pub async fn device_list_capability_options(
@@ -825,14 +952,10 @@ impl State {
         }
 
         // Also try decoded database via IoT if no LAN
-        if let Some(commands) =
-            crate::service::scene_database::scene_commands(&device.sku, scene)
-        {
+        if let Some(commands) = crate::service::scene_database::scene_commands(&device.sku, scene) {
             if let Some(iot) = self.get_iot_client().await {
                 if let Some(info) = &device.undoc_device_info {
-                    log::info!(
-                        "Using IoT API (decoded database) to set {device} to scene {scene}"
-                    );
+                    log::info!("Using IoT API (decoded database) to set {device} to scene {scene}");
                     iot.send_real(&info.entry, commands).await?;
                     self.device_mut(&device.sku, &device.id)
                         .await
@@ -983,6 +1106,39 @@ impl State {
         anyhow::bail!("Unable to set music autoColor for {device}");
     }
 
+    /// Program music mode with a caller-chosen palette. LAN-only: the
+    /// frames ride `ptReal`, and no other transport is verified for them
+    /// (docs/MUSIC_MODE.md). The burst is UDP without acknowledgement, so
+    /// it is sent twice, like the Govee app does — the sequence is
+    /// idempotent, and a lost burst otherwise means a silently ignored
+    /// command.
+    pub async fn device_set_music_palette(
+        self: &Arc<Self>,
+        device: &Device,
+        command: &SetMusicPalette,
+    ) -> anyhow::Result<()> {
+        let encoded = Base64HexBytes::encode_for_sku("Generic:Light", command)?.base64();
+
+        if let Some(lan_dev) = &device.lan_device {
+            log::info!("Using LAN API to set {device} music palette");
+            lan_dev.send_real(encoded.clone()).await?;
+            sleep(Duration::from_millis(300)).await;
+            lan_dev.send_real(encoded).await?;
+            // The device no longer shows whatever scene the bridge last
+            // applied; music mode replaces it.
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_active_scene(None);
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Unable to set music palette for {device}: it was not discovered \
+             on the LAN. Music palettes are LAN-only; check that LAN Control \
+             is enabled for this device in the Govee Home app"
+        );
+    }
+
     // Take care not to call this while you hold a mutable device
     // reference, as that will deadlock!
     pub async fn notify_of_state_change(self: &Arc<Self>, device_id: &str) -> anyhow::Result<()> {
@@ -991,14 +1147,14 @@ impl State {
         };
 
         // Emit event for any interested extensions
-        self.event_bus.emit(crate::service::event_bus::Event::DeviceStateChanged {
-            device_id: device_id.to_string(),
-        });
+        self.event_bus
+            .emit(crate::service::event_bus::Event::DeviceStateChanged {
+                device_id: device_id.to_string(),
+            });
 
         if let Some(hass) = self.get_hass_client().await {
             // Mark device as online since we just got a state update
-            let avail_topic =
-                crate::service::hass::device_availability_topic(&canonical_device);
+            let avail_topic = crate::service::hass::device_availability_topic(&canonical_device);
             if let Err(err) = hass.publish_retained(&avail_topic, "online").await {
                 log::warn!("Failed to publish device availability for {device_id}: {err:#}");
             }
@@ -1039,7 +1195,6 @@ impl State {
 
         log::info!("Graceful shutdown complete");
     }
-
 }
 
 pub fn sort_and_dedup_scenes(scenes: Vec<String>) -> Vec<String> {
@@ -1065,6 +1220,81 @@ pub fn sort_and_dedup_scenes(scenes: Vec<String>) -> Vec<String> {
     deduped
 }
 
+fn scene_platform_signature(device: &Device) -> Option<String> {
+    let info = device.http_device_info.as_ref()?;
+    let mut capabilities: Vec<_> = info
+        .capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect();
+    capabilities.sort();
+    Some(format!(
+        "{}:{}:{}",
+        info.sku,
+        info.device,
+        capabilities.join("|")
+    ))
+}
+
+fn merge_scene_catalog_sources(
+    undoc_categories: Vec<LightEffectCategory>,
+    platform_names: Vec<String>,
+    decoded_names: Vec<String>,
+) -> Vec<SceneCatalogCategory> {
+    let mut seen = HashSet::new();
+    let mut categories = vec![];
+
+    for category in undoc_categories {
+        let mut scenes = vec![];
+        for scene in category.scenes {
+            let valid = scene
+                .light_effects
+                .iter()
+                .any(|effect| effect.scene_code != 0);
+            let key = scene.scene_name.to_ascii_lowercase();
+            if valid && !scene.scene_name.is_empty() && seen.insert(key) {
+                scenes.push(SceneCatalogEntry {
+                    name: scene.scene_name,
+                    icon_urls: scene.icon_urls,
+                    hint: (!scene.scenes_hint.is_empty()).then_some(scene.scenes_hint),
+                });
+            }
+        }
+
+        if !scenes.is_empty() {
+            categories.push(SceneCatalogCategory {
+                name: category.category_name,
+                scenes,
+            });
+        }
+    }
+
+    let mut additional = vec![];
+    for name in platform_names.into_iter().chain(decoded_names) {
+        let key = name.to_ascii_lowercase();
+        if !name.is_empty() && seen.insert(key) {
+            additional.push(SceneCatalogEntry {
+                name,
+                icon_urls: vec![],
+                hint: None,
+            });
+        }
+    }
+
+    if !additional.is_empty() {
+        categories.push(SceneCatalogCategory {
+            name: if categories.is_empty() {
+                "All".to_string()
+            } else {
+                "Additional".to_string()
+            },
+            scenes: additional,
+        });
+    }
+
+    categories
+}
+
 fn enum_capability_names_from_device_info(device: &Device, instance: &str) -> Vec<String> {
     let Some(info) = &device.http_device_info else {
         return vec![];
@@ -1081,39 +1311,9 @@ fn enum_capability_names_from_device_info(device: &Device, instance: &str) -> Ve
     options.iter().map(|opt| opt.name.to_string()).collect()
 }
 
-fn merge_scene_name_sources(
-    platform_scenes: Vec<String>,
-    undoc_scenes: Vec<String>,
-) -> Vec<String> {
-    if undoc_scenes.is_empty() {
-        return sort_and_dedup_scenes(platform_scenes);
-    }
-
-    let mut merged = undoc_scenes;
-    merged.extend(platform_scenes);
-    sort_and_dedup_scenes(merged)
-}
-
-fn scene_names_from_undoc_categories(categories: Vec<LightEffectCategory>) -> Vec<String> {
-    let mut names = vec![];
-    for cat in categories {
-        for scene in cat.scenes {
-            for effect in scene.light_effects {
-                if effect.scene_code != 0 {
-                    names.push(scene.scene_name);
-                    break;
-                }
-            }
-        }
-    }
-    names
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        merge_scene_name_sources, scene_names_from_undoc_categories, sort_and_dedup_scenes, State,
-    };
+    use super::{merge_scene_catalog_sources, sort_and_dedup_scenes, State};
     use crate::lan_api::LanDevice;
     use crate::platform_api::HttpDeviceInfo;
     use crate::undoc_api::{LightEffectCategory, LightEffectEntry, LightEffectScene};
@@ -1175,21 +1375,21 @@ mod tests {
     }
 
     #[test]
-    fn scene_names_from_undoc_categories_only_includes_runnable_scenes() {
+    fn scene_catalog_only_includes_runnable_undocumented_scenes() {
         let categories = vec![LightEffectCategory {
             category_id: 1,
             category_name: "Life".to_string(),
             scenes: vec![
                 LightEffectScene {
                     scene_id: 10,
-                    icon_urls: vec![],
+                    icon_urls: vec!["https://example.invalid/forest.png".to_string()],
                     scene_name: "Forest".to_string(),
                     analytic_name: "forest".to_string(),
                     scene_type: 0,
                     scene_code: 0,
                     scence_category_id: 1,
                     pop_up_prompt: 0,
-                    scenes_hint: String::new(),
+                    scenes_hint: "Animated greens".to_string(),
                     rule: json!({}),
                     light_effects: vec![LightEffectEntry {
                         scence_param_id: 100,
@@ -1237,10 +1437,16 @@ mod tests {
             ],
         }];
 
+        let catalog = merge_scene_catalog_sources(categories, vec![], vec![]);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "Life");
+        assert_eq!(catalog[0].scenes.len(), 1);
+        assert_eq!(catalog[0].scenes[0].name, "Forest");
         assert_eq!(
-            scene_names_from_undoc_categories(categories),
-            vec!["Forest".to_string()]
+            catalog[0].scenes[0].hint.as_deref(),
+            Some("Animated greens")
         );
+        assert_eq!(catalog[0].scenes[0].icon_urls.len(), 1);
     }
 
     #[test]
@@ -1278,8 +1484,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_scene_name_sources_prefers_undoc_order_and_appends_platform_only_entries() {
-        let merged = merge_scene_name_sources(
+    fn scene_catalog_merges_platform_and_decoded_names_case_insensitively() {
+        let catalog = merge_scene_catalog_sources(
+            vec![],
             vec![
                 "".to_string(),
                 "Rainbow-B".to_string(),
@@ -1288,22 +1495,23 @@ mod tests {
                 "Music: Dynamic".to_string(),
             ],
             vec![
-                "Sunrise".to_string(),
+                "sunrise".to_string(),
                 "Aurora".to_string(),
-                "Work".to_string(),
+                "work".to_string(),
             ],
         );
 
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "All");
+        let merged: Vec<_> = catalog[0]
+            .scenes
+            .iter()
+            .map(|scene| scene.name.as_str())
+            .collect();
+
         assert_eq!(
             merged,
-            vec![
-                "".to_string(),
-                "Sunrise".to_string(),
-                "Aurora".to_string(),
-                "Work".to_string(),
-                "Rainbow-B".to_string(),
-                "Music: Dynamic".to_string(),
-            ]
+            vec!["Rainbow-B", "Sunrise", "Work", "Music: Dynamic", "Aurora",]
         );
     }
 }

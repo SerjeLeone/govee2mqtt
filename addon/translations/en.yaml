@@ -89,6 +89,27 @@ configuration:
       global broadcast address 255.255.255.255. To be honest, if
       multicast-UDP doesn't work, this isn't likely to work any
       better.
+  lan_query_attempts:
+    name: LAN Status Query Attempts
+    description: >-
+      Number of status-query packets sent before giving up (default 3).
+      Raising this tolerates slower devices but increases Wi-Fi traffic.
+  lan_query_backoff_ms:
+    name: LAN Status Query Backoff (ms)
+    description: >-
+      Initial wait between status-query attempts (default 350 ms).
+      The delay doubles for every retry and is capped at 3000 ms.
+  lan_breaker_threshold:
+    name: LAN Poll Circuit Breaker Threshold
+    description: >-
+      Suspend background polling after this many consecutive timeouts
+      (default 3). Set to 0 to disable the circuit breaker. Commands and
+      their confirmation polls remain available.
+  lan_breaker_cooldown:
+    name: LAN Poll Circuit Breaker Cooldown (s)
+    description: >-
+      Initial suspension period for an unresponsive device (default 300
+      seconds, allowed range 30-900). It doubles after repeated failures.
   disable_effects:
     name: Disable Effects
     description: >-
@@ -104,6 +125,26 @@ configuration:
       discovery. Only matching effects are included
       (case-insensitive). Leave blank for all effects. Ignored
       when Disable Effects is enabled.
+  govee_app_version:
+    name: Govee App Version Override
+    description: >-
+      Override the Govee Home app version string sent in the undoc
+      API login header. Set this when login fails with "The app
+      version is too low" — check the current version on the App
+      Store / Play Store listing, enter it here, and restart.
+  govee_2fa_code:
+    name: Govee 2FA Code
+    description: >-
+      Verification code Govee emails you when a new-device login
+      is required. Leave blank on first run — the addon will trigger
+      Govee to send you a code and log an error. Set this value and
+      restart within ~15 minutes before the code expires.
+  music_palette:
+    name: Enable Music Palette Commands
+    description: >-
+      Enable the experimental LAN-only MQTT command for custom music-mode
+      color palettes. Leave disabled unless your SKU is listed in
+      docs/MUSIC_MODE.md and LAN Control is enabled in the Govee app.
   poll_interval:
     name: "Poll Interval (Advanced)"
     description: >-
@@ -111,11 +152,3 @@ configuration:
       API. Default is 120. Increase to 900 if you have many devices
       without IoT or LAN support to avoid exceeding Govee's 10,000
       request/day API limit. Most users should leave this blank.
-
-
-
-
-
-
-
-

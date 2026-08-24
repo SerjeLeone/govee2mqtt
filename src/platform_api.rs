@@ -40,6 +40,10 @@ fn endpoint(url: &str) -> String {
     format!("{SERVER}{url}")
 }
 
+fn request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 #[derive(clap::Parser, Debug)]
 pub struct GoveeApiArguments {
     /// The Govee API Key. If not passed here, it will be read from
@@ -127,7 +131,7 @@ impl GoveeApiClient {
     ) -> anyhow::Result<ControlDeviceResponseCapability> {
         let url = endpoint("/router/api/v1/device/control");
         let request = ControlDeviceRequest {
-            request_id: "uuid".to_string(),
+            request_id: request_id(),
             payload: ControlDevicePayload {
                 sku: device.sku.to_string(),
                 device: device.device.to_string(),
@@ -154,7 +158,7 @@ impl GoveeApiClient {
     ) -> anyhow::Result<HttpDeviceState> {
         let url = endpoint("/router/api/v1/device/state");
         let request = GetDeviceStateRequest {
-            request_id: "uuid".to_string(),
+            request_id: request_id(),
             payload: GetDeviceStateRequestPayload {
                 sku: device.sku.to_string(),
                 device: device.device.to_string(),
@@ -189,7 +193,7 @@ impl GoveeApiClient {
             async {
                 let url = endpoint("/router/api/v1/device/diy-scenes");
                 let request = GetDeviceScenesRequest {
-                    request_id: "uuid".to_string(),
+                    request_id: request_id(),
                     payload: GetDeviceScenesPayload {
                         sku: device.sku.to_string(),
                         device: device.device.to_string(),
@@ -227,7 +231,7 @@ impl GoveeApiClient {
             async {
                 let url = endpoint("/router/api/v1/device/scenes");
                 let request = GetDeviceScenesRequest {
-                    request_id: "uuid".to_string(),
+                    request_id: request_id(),
                     payload: GetDeviceScenesPayload {
                         sku: device.sku.to_string(),
                         device: device.device.to_string(),
@@ -845,7 +849,11 @@ struct GetDevicesResponse {
 pub struct HttpDeviceInfo {
     pub sku: String,
     pub device: String,
-    #[serde(default, rename = "deviceName", deserialize_with = "deserialize_optional_localized_name")]
+    #[serde(
+        default,
+        rename = "deviceName",
+        deserialize_with = "deserialize_optional_localized_name"
+    )]
     pub device_name: String,
     #[serde(default, rename = "type")]
     pub device_type: DeviceType,
@@ -1006,6 +1014,7 @@ enum_string! {
 pub enum DeviceType {
     Light = "devices.types.light",
     AirPurifier = "devices.types.air_purifier",
+    AirQualityMonitor = "devices.types.air_quality_monitor",
     Thermometer = "devices.types.thermometer",
     Socket = "devices.types.socket",
     Sensor = "devices.types.sensor",
@@ -1176,7 +1185,9 @@ fn deserialize_optional_localized_name<'de, D: Deserializer<'de>>(
 }
 
 /// Deserialize a name that can be either a plain string or a localized map.
-fn deserialize_localized_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+fn deserialize_localized_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
     let value: JsonValue = Deserialize::deserialize(deserializer)?;
     Ok(match &value {
         JsonValue::String(s) => s.clone(),
@@ -1286,13 +1297,9 @@ pub async fn http_response_body<R: serde::de::DeserializeOwned>(
             .unwrap_or("unknown");
         let remaining_num: i64 = remaining.parse().unwrap_or(-1);
         if remaining_num < 1000 {
-            log::warn!(
-                "Govee API rate limit: {remaining} requests remaining (resets at {reset})"
-            );
+            log::warn!("Govee API rate limit: {remaining} requests remaining (resets at {reset})");
         } else {
-            log::trace!(
-                "Govee API rate limit: {remaining} remaining (resets at {reset})"
-            );
+            log::trace!("Govee API rate limit: {remaining} remaining (resets at {reset})");
         }
     }
 
@@ -1704,5 +1711,16 @@ mod test {
         });
         let info: HttpDeviceInfo = serde_json::from_value(json).unwrap();
         assert_eq!(info.device_name, "TV Backlight");
+    }
+
+    #[test]
+    fn request_ids_are_unique_uuids() {
+        let first = request_id();
+        let second = request_id();
+
+        assert_ne!(first, "uuid");
+        assert_ne!(first, second);
+        uuid::Uuid::parse_str(&first).unwrap();
+        uuid::Uuid::parse_str(&second).unwrap();
     }
 }

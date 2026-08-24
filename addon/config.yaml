@@ -34,6 +34,8 @@ schema:
   temperature_scale: "str?"
   govee_email: "str?"
   govee_password: "password?"
+  # One-shot verification code emailed by Govee after the first login attempt.
+  govee_2fa_code: "password?"
   govee_api_key: "password?"
   mqtt_host: "str?"
   mqtt_port: "int?"
@@ -44,8 +46,17 @@ schema:
   broadcast_all: "bool?"
   global_broadcast: "bool?"
   scan: "str?"
+  lan_query_attempts: "int(1,100)?"
+  lan_query_backoff_ms: "int(1,3000)?"
+  lan_breaker_threshold: "int(0,)?"
+  lan_breaker_cooldown: "int(30,900)?"
   disable_effects: "bool?"
   allowed_effects: "str?"
+  # Override the Govee Home app version string sent in API headers.
+  # Set this when login fails with "The app version is too low".
+  govee_app_version: "str?"
+  # Experimental LAN-only custom music palette commands.
+  music_palette: "bool?"
   # Advanced: polling interval in seconds (default 120).
   # Increase to 900 if you have many devices without IoT/LAN support
   # to avoid exceeding the Govee API rate limit (10,000 req/day).

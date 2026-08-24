@@ -8,6 +8,11 @@ UDP based protocol with the following requirements:
   in its settings in the Govee Home App
 * UDP ports 4001 and 4003 must be reachable on each Govee device
 
+For standalone or Docker installations, `GOVEE_LAN_LISTEN_PORT` can move the
+local response socket away from `4002` when another service already owns it.
+The Home Assistant app uses host networking, so resolve any host-level port
+conflict before starting it.
+
 ## Device Discovery
 
 Govee devices with LAN protocol enabled will listen for discovery packets
@@ -38,6 +43,19 @@ For a device to be shown as usable via the LAN API in Govee2MQTT:
 See [LAN API Control Config](CONFIG.md#lan-api-control) for more details on how
 to configure these options.
 
+## Status-query retries and circuit breaker
+
+LAN status queries use a bounded retry count with exponential backoff. After
+repeated timeouts, background polling for only the unresponsive device is
+temporarily suspended. Commands and their confirmation queries are never
+blocked, and any discovery or status response lets the device recover without
+waiting for the full cooldown. This prevents unreachable devices from
+amplifying congestion on a busy 2.4 GHz network.
+
+The retry count, initial backoff, timeout threshold, and cooldown are all
+configurable. See [Polling behavior on congested networks](CONFIG.md#polling-behavior-on-congested-networks)
+for the exact options and defaults.
+
 ## Router / Network Setup tips
 
 * Some routers have optimizations that prevent multicast-UDP from crossing from
@@ -56,4 +74,3 @@ to configure these options.
 
 * If you have an IOT VLAN or similar, ensure that your firewall is not blocking
   the ports mentioned above
-

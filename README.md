@@ -16,8 +16,12 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
   control them even when your primary internet connection is offline.
 * Support for per-device modes and scenes, including dedicated scene selects
   for lightScene, diyScene, snapshot, nightlightScene, and music modes.
+* Categorized scene catalogs enriched with icons and hints, plus Home Assistant
+  buttons for cycling to the next or previous scene.
 * Support for the undocumented AWS IoT interface to your devices, providing
   low latency status updates.
+* Two-factor login support with one-shot verification codes and a configurable
+  Govee Home app version for recovering from upstream login changes.
 * Support for the official [Platform
   API](https://developer.govee.com/reference/get-you-devices) in case the AWS
   IoT or LAN control is unavailable.
@@ -26,8 +30,14 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 * Device grouping — control multiple devices as one light entity.
 * Per-device configuration overrides via JSON file (names, color temp, icons, rooms).
 * Web UI with device controls, live log viewer, and bridge status dashboard.
+* Native Home Assistant fan entities, air-quality sensors, and diagnostic
+  battery/Wi-Fi sensors for supported devices.
+* Bounded LAN retries and a per-device polling circuit breaker for congested or
+  partially unavailable networks.
+* Experimental LAN music-mode palettes for explicitly mapped device models.
 * Graceful shutdown with proper MQTT offline status publishing.
 * Persistent device database for offline/degraded mode operation.
+* Log timestamps use the Home Assistant or host system timezone.
 
 |Feature|Requires|Notes|
 |-------|--------|-------------|
@@ -40,6 +50,10 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 |Effect List Filtering|API Key|Disable or filter effects for Google Home compatibility|
 |Device Groups|Config file|Control multiple devices as a single HA light entity|
 |ptReal Command Replay|LAN or IoT|Send captured DIY scene commands via HTTP API|
+|Categorized Scene Catalog|API Key and/or IoT|Scene metadata, current scene, and next/previous controls in Home Assistant|
+|Fan Control|API Key and/or IoT|Power, stepped speed, and supported preset modes as an HA fan entity|
+|Air Quality and Diagnostics|Device dependent|CO2, PM2.5, PM10, battery, and Wi-Fi entities when reported by the device|
+|Custom Music Palettes|LAN + opt-in setting|Experimental multi-colour music mode for explicitly mapped SKUs|
 
 ### API Channels
 
@@ -81,9 +95,9 @@ Web UI: `http://localhost:8056` | MQTT: `localhost:1883` | Health: `http://local
 ### Testing
 
 ```bash
-make test                              # unit tests (131 tests)
-cargo test --test lan_simulator        # LAN protocol simulator (4 tests)
-cargo test --test mqtt_integration -- --test-threads=1  # MQTT integration (3 tests, needs Docker)
+make test                              # unit tests
+cargo test --test lan_simulator        # LAN protocol simulator
+cargo test --test mqtt_integration -- --test-threads=1  # MQTT integration (needs Docker)
 ```
 
 ## MQTT Topics
@@ -118,6 +132,10 @@ Publish to these topics to control the bridge via MQTT:
 | `gv2mqtt/{device}/availability` | Per-device online/offline |
 | `gv2mqtt/{device}/push_event` | Raw Govee push API events |
 | `gv2mqtt/{device}/lack_water` | Humidifier low water alert |
+| `gv2mqtt/{device}/scene-catalog` | Retained categorized scene metadata and active scene |
+| `gv2mqtt/{device}/scene-next` | Activate the next available scene |
+| `gv2mqtt/{device}/scene-prev` | Activate the previous available scene |
+| `gv2mqtt/{device}/set-music-palette` | Set an opt-in LAN music-mode palette; see [music mode](docs/MUSIC_MODE.md) |
 
 ## HTTP API
 
@@ -133,6 +151,7 @@ Publish to these topics to control the bridge via MQTT:
 | `/api/device/{id}/colortemp/{kelvin}` | POST | Set color temperature |
 | `/api/device/{id}/scene/{name}` | POST | Activate scene |
 | `/api/device/{id}/scenes` | GET | List available scenes |
+| `/api/device/{id}/scene-catalog` | GET | Get categorized scenes, icons, and hints |
 | `/api/device/{id}/ptreal` | POST | Send raw ptReal commands |
 | `/api/config` | GET/PUT | Read or update device config |
 | `/api/oneclicks` | GET | List one-click scenes |

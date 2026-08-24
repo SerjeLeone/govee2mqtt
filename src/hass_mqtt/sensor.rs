@@ -123,6 +123,9 @@ impl CapabilitySensor {
             "electricPower" | "powerConsumption" => Some("W"),
             "voltage" => Some("V"),
             "energy" | "energyConsumption" => Some("kWh"),
+            "carbonDioxideConcentration" | "carbonDioxide" | "co2" => Some("ppm"),
+            "pm25Concentration" | "pm25" => Some("µg/m³"),
+            "pm10Concentration" | "pm10" => Some("µg/m³"),
             _ => None,
         };
 
@@ -133,11 +136,22 @@ impl CapabilitySensor {
             "electricPower" | "powerConsumption" => Some("power"),
             "voltage" => Some("voltage"),
             "energy" | "energyConsumption" => Some("energy"),
+            "carbonDioxideConcentration" | "carbonDioxide" | "co2" => Some("carbon_dioxide"),
+            "pm25Concentration" | "pm25" => Some("pm25"),
+            "pm10Concentration" | "pm10" => Some("pm10"),
             _ => None,
         };
 
         let state_class = match instance.instance.as_str() {
-            "sensorTemperature" | "sensorHumidity" => Some(StateClass::Measurement),
+            "sensorTemperature"
+            | "sensorHumidity"
+            | "carbonDioxideConcentration"
+            | "carbonDioxide"
+            | "co2"
+            | "pm25Concentration"
+            | "pm25"
+            | "pm10Concentration"
+            | "pm10" => Some(StateClass::Measurement),
             "electricCurrent" | "electricPower" | "powerConsumption" | "voltage" => {
                 Some(StateClass::Measurement)
             }
@@ -153,13 +167,30 @@ impl CapabilitySensor {
             "electricPower" | "powerConsumption" => "Power".to_string(),
             "voltage" => "Voltage".to_string(),
             "energy" | "energyConsumption" => "Energy".to_string(),
+            "carbonDioxideConcentration" | "carbonDioxide" | "co2" => "CO₂".to_string(),
+            "pm25Concentration" | "pm25" => "PM2.5".to_string(),
+            "pm10Concentration" | "pm10" => "PM10".to_string(),
             _ => crate::service::hass::camel_case_to_space_separated(&instance.instance),
         };
 
-        // Energy/power sensors are primary entities, not diagnostics
+        // Primary entities (user-facing measurements) vs diagnostics.
+        // Air-quality sensors are primary like power/energy.
         let entity_category = match instance.instance.as_str() {
-            "electricCurrent" | "electricPower" | "powerConsumption" | "voltage" | "energy"
-            | "energyConsumption" => None,
+            "electricCurrent"
+            | "electricPower"
+            | "powerConsumption"
+            | "voltage"
+            | "energy"
+            | "energyConsumption"
+            | "sensorTemperature"
+            | "sensorHumidity"
+            | "carbonDioxideConcentration"
+            | "carbonDioxide"
+            | "co2"
+            | "pm25Concentration"
+            | "pm25"
+            | "pm10Concentration"
+            | "pm10" => None,
             _ => Some("diagnostic".to_string()),
         };
 
@@ -344,9 +375,280 @@ impl EntityInstance for DeviceStatusDiagnostic {
     }
 }
 
+/// Bridge-side scene state and catalog metadata. Govee does not expose the
+/// currently active scene, so this reports the scene last applied by gv2mqtt.
+pub struct SceneInfoSensor {
+    sensor: SensorConfig,
+    device_id: String,
+    device_topic_id: String,
+    state: StateHandle,
+}
+
+impl SceneInfoSensor {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!("sensor-{id}-gv2mqtt-scene-info", id = topic_safe_id(device));
+        let mut base =
+            EntityConfig::for_device(device, Some("Scene Info".to_string()), unique_id.clone());
+        base.icon = Some("mdi:palette".to_string());
+
+        Self {
+            sensor: SensorConfig {
+                base,
+                state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
+                state_class: None,
+                json_attributes_topic: Some(format!("gv2mqtt/sensor/{unique_id}/attributes")),
+                unit_of_measurement: None,
+            },
+            device_id: device.id.to_string(),
+            device_topic_id: topic_safe_id(device),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for SceneInfoSensor {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.sensor.publish(state, client).await?;
+
+        if let Some(device) = self.state.device_by_id(&self.device_id).await {
+            let catalog = self
+                .state
+                .device_list_scenes_categorized(&device)
+                .await
+                .unwrap_or_default();
+            if !catalog.is_empty() {
+                let topic = format!("gv2mqtt/{}/scene-catalog", self.device_topic_id);
+                if let Err(err) = client.publish_obj_retained(&topic, &catalog).await {
+                    log::warn!("Failed to publish scene catalog for {device}: {err:#}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "scene info sensor").await
+        else {
+            return Ok(());
+        };
+
+        let active = device.active_scene_name();
+        let scene_name = active.unwrap_or("None").to_string();
+        let catalog = self
+            .state
+            .device_list_scenes_categorized(&device)
+            .await
+            .unwrap_or_default();
+        let flat: Vec<_> = catalog
+            .iter()
+            .flat_map(|category| {
+                category
+                    .scenes
+                    .iter()
+                    .map(move |scene| (scene, category.name.as_str()))
+            })
+            .collect();
+        let current_index = active.and_then(|name| {
+            flat.iter()
+                .position(|(scene, _)| scene.name.eq_ignore_ascii_case(name))
+        });
+
+        let (category, index, next_scene, previous_scene) = match current_index {
+            Some(index) => {
+                let next = (index + 1) % flat.len();
+                let previous = if index == 0 {
+                    flat.len() - 1
+                } else {
+                    index - 1
+                };
+                (
+                    flat[index].1.to_string(),
+                    index,
+                    flat[next].0.name.clone(),
+                    flat[previous].0.name.clone(),
+                )
+            }
+            None => (
+                "Unknown".to_string(),
+                0,
+                flat.first()
+                    .map(|(scene, _)| scene.name.clone())
+                    .unwrap_or_default(),
+                flat.last()
+                    .map(|(scene, _)| scene.name.clone())
+                    .unwrap_or_default(),
+            ),
+        };
+
+        let thumbnail = current_index
+            .and_then(|index| flat[index].0.icon_urls.first().cloned())
+            .unwrap_or_default();
+        let hint = current_index
+            .and_then(|index| flat[index].0.hint.clone())
+            .unwrap_or_default();
+        let is_on = device
+            .device_state()
+            .and_then(|device_state| device_state.light_on)
+            .unwrap_or(false);
+        let attributes = json!({
+            "scene_name": scene_name,
+            "category": category,
+            "index": index,
+            "total": flat.len(),
+            "next_scene": next_scene,
+            "prev_scene": previous_scene,
+            "has_active_scene": active.is_some(),
+            "thumbnail": thumbnail,
+            "hint": hint,
+            "is_on": is_on,
+        });
+
+        self.sensor.notify_state(client, &scene_name).await?;
+        if let Some(topic) = &self.sensor.json_attributes_topic {
+            client.publish_obj(topic, attributes).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Diagnostic sensor that exposes a device setting (battery %, wifi signal)
+/// sourced from the undoc API's DeviceSettings struct. Not live — refreshed
+/// only when the undoc device list is re-fetched — but better than nothing
+/// for automations that check "is my H5179 still in range / battery full".
+pub struct DeviceSettingDiagnostic {
+    sensor: SensorConfig,
+    device_id: String,
+    state: StateHandle,
+    field: DeviceSettingField,
+    /// Suppress MQTT publishes when the value hasn't changed. Device
+    /// settings update only on device-list re-fetch (~10 min), so the
+    /// poll-cycle (~30 s) caller would otherwise republish ~20x uselessly.
+    last_published: std::sync::Mutex<Option<i64>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceSettingField {
+    Battery,
+    WifiLevel,
+}
+
+impl DeviceSettingField {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Battery => "battery",
+            Self::WifiLevel => "wifi-signal",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Battery => "Battery",
+            Self::WifiLevel => "Wi-Fi Signal",
+        }
+    }
+
+    fn device_class(self) -> Option<&'static str> {
+        match self {
+            Self::Battery => Some("battery"),
+            // HA's `signal_strength` device class expects dBm; Govee reports
+            // Wi-Fi as a 0-100 percentage, so we expose it as a plain sensor
+            // rather than trigger an HA validation warning.
+            Self::WifiLevel => None,
+        }
+    }
+
+    fn unit(self) -> Option<&'static str> {
+        Some("%")
+    }
+}
+
+impl DeviceSettingDiagnostic {
+    /// Returns `None` when the device has no value for this field, so the
+    /// enumerator can skip publishing an empty sensor without double-reading
+    /// the undoc device info.
+    pub fn for_device(
+        device: &ServiceDevice,
+        state: &StateHandle,
+        field: DeviceSettingField,
+    ) -> Option<Self> {
+        let settings = &device
+            .undoc_device_info
+            .as_ref()?
+            .entry
+            .device_ext
+            .device_settings;
+        match field {
+            DeviceSettingField::Battery => settings.battery?,
+            DeviceSettingField::WifiLevel => settings.wifi_level?,
+        };
+
+        let unique_id = format!(
+            "sensor-{id}-{slug}",
+            id = topic_safe_id(device),
+            slug = field.slug()
+        );
+
+        let mut base =
+            EntityConfig::for_device(device, Some(field.name().to_string()), unique_id.clone());
+        base.entity_category = Some("diagnostic".to_string());
+        base.device_class = field.device_class();
+
+        Some(Self {
+            sensor: SensorConfig {
+                base,
+                state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
+                state_class: Some(StateClass::Measurement),
+                json_attributes_topic: None,
+                unit_of_measurement: field.unit(),
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+            field,
+            last_published: Default::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl EntityInstance for DeviceSettingDiagnostic {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.sensor.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let Some(device) =
+            lookup_entity_device(&self.state, &self.device_id, "device setting diagnostic").await
+        else {
+            return Ok(());
+        };
+        let Some(info) = device.undoc_device_info.as_ref() else {
+            return Ok(());
+        };
+        let Some(value) = (match self.field {
+            DeviceSettingField::Battery => info.entry.device_ext.device_settings.battery,
+            DeviceSettingField::WifiLevel => info.entry.device_ext.device_settings.wifi_level,
+        }) else {
+            return Ok(());
+        };
+
+        {
+            let mut last = self.last_published.lock().unwrap();
+            if *last == Some(value) {
+                return Ok(());
+            }
+            *last = Some(value);
+        }
+
+        self.sensor.notify_state(client, &value.to_string()).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DeviceStatusDiagnostic, GlobalFixedDiagnostic};
+    use super::{DeviceSettingField, DeviceStatusDiagnostic, GlobalFixedDiagnostic};
     use crate::hass_mqtt::instance::EntityInstance;
     use crate::lan_api::{DeviceColor, DeviceStatus};
     use crate::service::hass::HassClient;
@@ -386,6 +688,7 @@ mod tests {
                 brightness: 100,
                 color: DeviceColor { r: 1, g: 2, b: 3 },
                 color_temperature_kelvin: 0,
+                mode: None,
             });
         }
 
@@ -424,6 +727,7 @@ mod tests {
                 brightness: 100,
                 color: DeviceColor { r: 0, g: 0, b: 0 },
                 color_temperature_kelvin: 0,
+                mode: None,
             });
         }
 
@@ -461,5 +765,21 @@ mod tests {
             sensor.sensor.base.entity_category.is_none(),
             "electricPower should not be a diagnostic entity"
         );
+    }
+
+    /// HA's `signal_strength` device class expects dBm; Govee reports Wi-Fi
+    /// as a 0-100 percentage. Exposing it with `signal_strength` and `%`
+    /// triggers a validation warning, so the Wi-Fi field must have no
+    /// device_class.
+    #[test]
+    fn device_setting_field_wifi_has_no_device_class() {
+        assert_eq!(DeviceSettingField::WifiLevel.device_class(), None);
+        assert_eq!(DeviceSettingField::WifiLevel.unit(), Some("%"));
+    }
+
+    #[test]
+    fn device_setting_field_battery_uses_battery_device_class() {
+        assert_eq!(DeviceSettingField::Battery.device_class(), Some("battery"));
+        assert_eq!(DeviceSettingField::Battery.unit(), Some("%"));
     }
 }

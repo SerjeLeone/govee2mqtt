@@ -14,12 +14,16 @@ Common options:
 
 - `temperature_scale`: `C` or `F`
 - `govee_email` / `govee_password`: Enables Govee account login features (IoT, one-click scenes, room names)
+- `govee_2fa_code`: One-shot code emailed by Govee after a challenged login; leave blank on the first attempt
+- `govee_app_version`: Override the Govee Home app version if the undocumented API rejects the bundled fallback
 - `govee_api_key`: Enables official Govee Platform API features (scenes, device metadata, real-time push updates)
 - `mqtt_host` / `mqtt_port` / `mqtt_username` / `mqtt_password`: Override broker auto-discovery if you are not using the Mosquitto app
 - `debug_level`: Rust log filter such as `govee=trace`
 - `no_multicast`, `broadcast_all`, `global_broadcast`, `scan`: LAN discovery tuning
 - `disable_effects`: Disable effects in MQTT discovery (fixes Google Home offline issue)
 - `allowed_effects`: Comma-separated whitelist of effect names to include
+- `lan_query_attempts`, `lan_query_backoff_ms`, `lan_breaker_threshold`, `lan_breaker_cooldown`: Bound LAN status traffic from unresponsive devices
+- `music_palette`: Enable the experimental LAN-only custom music palette topic
 
 If `mqtt_host` is left empty, the app waits for the Home Assistant MQTT service and uses the broker details provided by Supervisor.
 

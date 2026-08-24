@@ -16,6 +16,13 @@ pub struct DeviceOverride {
     pub prefer_lan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_effects: Option<bool>,
+    /// Per-device allowlist of effect names to publish in HA MQTT discovery.
+    /// When set (non-empty), only these effects will appear in `effect_list`.
+    /// Overrides the global `GOVEE_ALLOWED_EFFECTS` env var for this device.
+    /// Useful for keeping the Google Home SYNC payload under its size limit
+    /// without losing scene control inside HA.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,8 +52,7 @@ static CONFIG: once_cell::sync::Lazy<ArcSwap<DeviceConfigFile>> =
     once_cell::sync::Lazy::new(|| ArcSwap::new(Arc::new(DeviceConfigFile::default())));
 
 /// Track file modification time for hot-reload.
-static LAST_MODIFIED: std::sync::Mutex<Option<std::time::SystemTime>> =
-    std::sync::Mutex::new(None);
+static LAST_MODIFIED: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
 
 fn config_path() -> PathBuf {
     let mut path = std::env::var_os("XDG_CACHE_HOME")
@@ -167,9 +173,7 @@ fn validate_config(config: &DeviceConfigFile) {
     for (key, ovr) in &config.devices {
         if let Some((min, max)) = ovr.color_temp_range {
             if min >= max {
-                log::warn!(
-                    "Device config [{key}]: color_temp_range min ({min}) >= max ({max})"
-                );
+                log::warn!("Device config [{key}]: color_temp_range min ({min}) >= max ({max})");
             }
             if min < 1000 || max > 12000 {
                 log::warn!(
@@ -180,9 +184,7 @@ fn validate_config(config: &DeviceConfigFile) {
         }
         if let Some(ref icon) = ovr.icon {
             if !icon.starts_with("mdi:") {
-                log::warn!(
-                    "Device config [{key}]: icon \"{icon}\" doesn't start with \"mdi:\""
-                );
+                log::warn!("Device config [{key}]: icon \"{icon}\" doesn't start with \"mdi:\"");
             }
         }
     }
@@ -230,6 +232,7 @@ mod tests {
             color_temp_range: Some((2000, 6500)),
             prefer_lan: Some(true),
             disable_effects: None,
+            allowed_effects: Some(vec!["Sunrise".into(), "Sunset".into()]),
             room: Some("Living Room".into()),
             icon: Some("mdi:lightbulb".into()),
         };
@@ -239,6 +242,10 @@ mod tests {
         assert_eq!(parsed.color_temp_range, Some((2000, 6500)));
         assert_eq!(parsed.prefer_lan, Some(true));
         assert!(parsed.disable_effects.is_none());
+        assert_eq!(
+            parsed.allowed_effects.as_deref(),
+            Some(&["Sunrise".to_string(), "Sunset".to_string()][..])
+        );
         assert_eq!(parsed.room.as_deref(), Some("Living Room"));
         assert_eq!(parsed.icon.as_deref(), Some("mdi:lightbulb"));
     }
@@ -291,10 +298,7 @@ mod tests {
         let parsed: DeviceConfigFile = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.devices.len(), 1);
         assert_eq!(parsed.groups.len(), 1);
-        assert_eq!(
-            parsed.devices["AA:BB"].name.as_deref(),
-            Some("Test")
-        );
+        assert_eq!(parsed.devices["AA:BB"].name.as_deref(), Some("Test"));
     }
 
     #[test]
@@ -305,8 +309,7 @@ mod tests {
         assert!(parsed.groups.is_empty());
 
         // Only devices key
-        let parsed: DeviceConfigFile =
-            serde_json::from_str(r#"{"devices": {}}"#).unwrap();
+        let parsed: DeviceConfigFile = serde_json::from_str(r#"{"devices": {}}"#).unwrap();
         assert!(parsed.devices.is_empty());
         assert!(parsed.groups.is_empty());
     }

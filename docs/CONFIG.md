@@ -21,7 +21,22 @@ updates without polling.
 |---|---|-----|-------|
 |`--govee-email`|`GOVEE_EMAIL`|`govee_email`|The email address you registered with your govee account|
 |`--govee-password`|`GOVEE_PASSWORD`|`govee_password`|The password you registered for your govee account|
+|`--govee-2fa-code`|`GOVEE_2FA_CODE`|`govee_2fa_code`|One-shot verification code emailed by Govee after a challenged login|
+|`--govee-app-version`|`GOVEE_APP_VERSION`|`govee_app_version`|Override the Govee Home app version sent to the undocumented API|
 |`--api-key`|`GOVEE_API_KEY`|`govee_api_key`|The API key you requested from Govee support|
+
+### Two-factor login
+
+Leave `govee_2fa_code` empty on the first start. If Govee challenges the
+login, the bridge requests a verification email and logs instructions. Enter
+the emailed code and restart the bridge within about 15 minutes. The code is
+discarded after a successful login so it is not replayed during token refresh.
+If the code is rejected or has expired, clear it, restart once without a code
+to request a new email, then enter the new code and restart again.
+
+If Govee reports that the app version is too low, set `govee_app_version` to
+the current Govee Home version and restart. The bundled fallback is used when
+the option is empty.
 
 *Concerned about sharing your credentials? See [Privacy](PRIVACY.md) for
 information about how data is used and retained by `govee2mqtt`*
@@ -54,6 +69,44 @@ on some networks, especially across wifi access points and routers.
 |N/A|`GOVEE_LAN_LISTEN_PORT=4002`|N/A|Override the LAN response listen port (default 4002). Useful when the Matter Server or another integration conflicts.|
 
 [Read more about LAN API Requirements here](LAN.md)
+
+### Polling behavior on congested networks
+
+Govee2MQTT polls every LAN device for its status at least every 30 seconds
+(the pass over all devices is serial, so unresponsive devices stretch the
+cycle) and after each command. On a congested 2.4 GHz network, retries for
+unresponsive devices used to pile up (up to ~29 packets per device per
+status query), making the congestion worse. Two mechanisms bound this; both
+are tunable without rebuilding:
+
+|CLI|ENV|App Config|Default|What it does|
+|---|---|----------|-------|------------|
+|`--lan-query-attempts`|`GOVEE_LAN_QUERY_ATTEMPTS=3`|`lan_query_attempts`|`3`|How many times a status query is sent before giving up. Clamped to 1–100.|
+|`--lan-query-backoff-ms`|`GOVEE_LAN_QUERY_BACKOFF_MS=350`|`lan_query_backoff_ms`|`350`|Wait after the first attempt, in milliseconds. Doubles on each retry, capped at 3000 ms (the cap is fixed). Defaults give waits of 350 ms → 700 ms → 1400 ms, ~2.5 s total.|
+|`--lan-breaker-threshold`|`GOVEE_LAN_BREAKER_THRESHOLD=3`|`lan_breaker_threshold`|`3`|After this many consecutive timeouts, background polling of that device is suspended (circuit breaker). `0` disables the breaker.|
+|`--lan-breaker-cooldown`|`GOVEE_LAN_BREAKER_COOLDOWN=300`|`lan_breaker_cooldown`|`300`|Suspension length in seconds, clamped to 30–900. Doubles on repeated failure, capped at 900 s.|
+
+The tradeoff: lowering attempts makes a congested network recover faster but
+makes a slow-to-respond device more likely to report stale state. If you have
+a device that reliably answers only after several seconds, raise
+`lan_query_attempts` to 4–5. (Above 3 attempts a single query cycle exceeds
+the ~5 s post-command confirmation window, so the confirmation poll makes one
+full pass instead of re-checking until the commanded value sticks.)
+
+The circuit breaker only affects **background polling**. Commands you send
+(turn on, brightness, color) always go out, and their confirmation polls
+always run. A suspended device that shows any sign of life — a discovery
+response, for example — is granted an immediate status probe instead of
+waiting out the cooldown, and the first successful status reply fully
+resets the breaker; recovery after an outage therefore takes at most about
+a minute. A device that answers discovery but keeps dropping status queries
+stays suspended, at the cost of one probe per discovery cycle. Note that a
+timed-out confirmation poll still counts toward the breaker threshold even
+though it is never blocked: unreachability is evidence no matter which poll
+observed it.
+
+See [LAN API requirements and troubleshooting](LAN.md) for port and network
+topology details.
 
 ## MQTT Configuration
 
@@ -105,6 +158,7 @@ The file is **hot-reloaded** — changes are picked up automatically without res
       "color_temp_range": [2700, 6500],
       "room": "Kitchen",
       "disable_effects": true,
+      "allowed_effects": ["Forest", "Aurora"],
       "icon": "mdi:ceiling-light"
     },
     "H6076": {
@@ -131,6 +185,7 @@ Keys can be device IDs (exact match) or SKU model numbers (all devices of that m
 | `color_temp_range` | [min, max] | Override color temperature range in Kelvin |
 | `prefer_lan` | bool | Force LAN API when available |
 | `disable_effects` | bool | Disable effects for this device |
+| `allowed_effects` | [string] | Per-device effect whitelist; takes precedence over the global whitelist |
 | `room` | string | Override suggested area in HA |
 | `icon` | string | MDI icon override (e.g. `mdi:floor-lamp`) |
 
@@ -174,3 +229,5 @@ device quirks without code changes:
 |`GOVEE_CACHE_DIR=/path`|N/A|Override cache directory|
 |`GOVEE_TEMPERATURE_SCALE=F`|`temperature_scale`|Use Fahrenheit (default: Celsius)|
 |`GOVEE_POLL_INTERVAL=120`|`poll_interval`|Platform API polling interval in seconds (default: 120). Increase to 900 if you have many devices without IoT/LAN support to stay under the 10,000 req/day API limit.|
+|`GOVEE_MUSIC_PALETTE=true`|`music_palette`|Enable the experimental LAN-only custom music palette topic; see [Music Mode](MUSIC_MODE.md).|
+|`TZ=Europe/Berlin`|N/A|Use this IANA timezone in console, file, and Web UI log timestamps. The Home Assistant app inherits the Supervisor timezone automatically; standalone runs otherwise use the host system timezone.|

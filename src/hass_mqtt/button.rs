@@ -93,6 +93,31 @@ impl ButtonConfig {
         }
     }
 
+    pub fn scene_next_for_device(device: &ServiceDevice) -> Self {
+        let unique_id = format!("gv2mqtt-{id}-scene-next", id = topic_safe_id(device));
+        let command_topic = format!("gv2mqtt/{id}/scene-next", id = topic_safe_id(device));
+        let mut base = EntityConfig::for_device(device, Some("Scene Next".to_string()), unique_id);
+        base.icon = Some("mdi:skip-next".to_string());
+        Self {
+            base,
+            command_topic,
+            payload_press: None,
+        }
+    }
+
+    pub fn scene_prev_for_device(device: &ServiceDevice) -> Self {
+        let unique_id = format!("gv2mqtt-{id}-scene-prev", id = topic_safe_id(device));
+        let command_topic = format!("gv2mqtt/{id}/scene-prev", id = topic_safe_id(device));
+        let mut base =
+            EntityConfig::for_device(device, Some("Scene Previous".to_string()), unique_id);
+        base.icon = Some("mdi:skip-previous".to_string());
+        Self {
+            base,
+            command_topic,
+            payload_press: None,
+        }
+    }
+
     pub fn request_platform_data_for_device(device: &ServiceDevice) -> Self {
         let unique_id = format!(
             "gv2mqtt-{id}-request-platform-data",
@@ -154,7 +179,10 @@ mod tests {
         let device = Device::new("H7160", "AA:BB");
         let button = ButtonConfig::activate_work_mode_preset(&device, "High", "humidity", 1, 8);
         assert_eq!(button.base.name.as_deref(), Some("High"));
-        assert_eq!(button.command_topic, "gv2mqtt/number/AABB/command/humidity/1");
+        assert_eq!(
+            button.command_topic,
+            "gv2mqtt/number/AABB/command/humidity/1"
+        );
         assert_eq!(button.payload_press.as_deref(), Some("8"));
     }
 
@@ -166,10 +194,7 @@ mod tests {
             button.base.name.as_deref(),
             Some("Request Platform API State")
         );
-        assert_eq!(
-            button.base.entity_category.as_deref(),
-            Some("diagnostic")
-        );
+        assert_eq!(button.base.entity_category.as_deref(), Some("diagnostic"));
         assert_eq!(button.command_topic, "gv2mqtt/AABB/request-platform-data");
 
         let _entity_trait: &dyn EntityInstance = &button;

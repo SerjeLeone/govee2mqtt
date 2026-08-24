@@ -86,10 +86,7 @@ fn get_auth_token() -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
-async fn require_auth_token(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+async fn require_auth_token(request: Request<axum::body::Body>, next: Next) -> Response {
     let Some(expected) = get_auth_token() else {
         return next.run(request).await;
     };
@@ -143,6 +140,7 @@ async fn resolve_device_read_only(state: &StateHandle, id: &str) -> Result<Devic
 async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Response> {
     let mut devices = state.devices().await;
     devices.sort_by_key(|d| (d.room_name().map(|name| name.to_string()), d.name()));
+    let mqtt_configured = state.get_hass_client().await.is_some();
 
     #[derive(Serialize)]
     struct DeviceItem {
@@ -153,18 +151,31 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         pub room: Option<String>,
         pub ip: Option<IpAddr>,
         pub state: Option<DeviceState>,
+        pub mqtt_configured: bool,
+        pub api_metadata: bool,
+        pub lan_discovered: bool,
+        pub cloud_online: Option<bool>,
     }
 
     let devices: Vec<_> = devices
         .into_iter()
-        .map(|d| DeviceItem {
-            name: d.name(),
-            room: d.room_name().map(|r| r.to_string()),
-            ip: d.ip_addr(),
-            state: d.device_state(),
-            safe_id: topic_safe_string(&d.id),
-            sku: d.sku,
-            id: d.id,
+        .map(|d| {
+            let device_state = d.device_state();
+            let cloud_online = device_state.as_ref().and_then(|value| value.online);
+            let ip = d.ip_addr();
+            DeviceItem {
+                name: d.name(),
+                room: d.room_name().map(|r| r.to_string()),
+                ip,
+                state: device_state,
+                mqtt_configured,
+                api_metadata: d.http_device_info.is_some(),
+                lan_discovered: ip.is_some(),
+                cloud_online,
+                safe_id: topic_safe_string(&d.id),
+                sku: d.sku,
+                id: d.id,
+            }
         })
         .collect();
 
@@ -290,14 +301,17 @@ async fn device_send_ptreal(
     }
 
     if let Some(lan_dev) = &device.lan_device {
-        log::info!("Sending ptReal to {device} via LAN ({} commands)", commands.len());
-        lan_dev
-            .send_real(commands)
-            .await
-            .map_err(generic)?;
+        log::info!(
+            "Sending ptReal to {device} via LAN ({} commands)",
+            commands.len()
+        );
+        lan_dev.send_real(commands).await.map_err(generic)?;
     } else if let Some(iot) = state.get_iot_client().await {
         if let Some(info) = &device.undoc_device_info {
-            log::info!("Sending ptReal to {device} via IoT ({} commands)", commands.len());
+            log::info!(
+                "Sending ptReal to {device} via IoT ({} commands)",
+                commands.len()
+            );
             iot.send_real(&info.entry, commands)
                 .await
                 .map_err(generic)?;
@@ -320,6 +334,19 @@ async fn device_list_scenes(
     let scenes = state.device_list_scenes(&device).await.map_err(generic)?;
 
     Ok(Json(scenes).into_response())
+}
+
+/// Returns available scenes with their original category and media metadata.
+async fn device_list_scenes_categorized(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let device = resolve_device_read_only(&state, &id).await?;
+    let catalog = state
+        .device_list_scenes_categorized(&device)
+        .await
+        .map_err(generic)?;
+    Ok(Json(catalog).into_response())
 }
 
 fn scene_names_from_undoc_categories(categories: &[LightEffectCategory]) -> Vec<String> {
@@ -533,9 +560,8 @@ async fn get_config() -> Response {
 }
 
 async fn put_config(Json(body): Json<serde_json::Value>) -> Result<Response, Response> {
-    let config: crate::service::device_config::DeviceConfigFile =
-        serde_json::from_value(body)
-            .map_err(|e| bad_request(format!("Invalid config JSON: {e}")))?;
+    let config: crate::service::device_config::DeviceConfigFile = serde_json::from_value(body)
+        .map_err(|e| bad_request(format!("Invalid config JSON: {e}")))?;
 
     crate::service::device_config::save_config(&config).map_err(generic)?;
 
@@ -633,6 +659,10 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
         .route("/api/device/{id}/scene/{scene}", post(device_set_scene))
         .route("/api/device/{id}/ptreal", post(device_send_ptreal))
         .route("/api/device/{id}/scenes", get(device_list_scenes))
+        .route(
+            "/api/device/{id}/scene-catalog",
+            get(device_list_scenes_categorized),
+        )
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/oneclicks", get(list_one_clicks))
         .route("/api/oneclick/activate/{scene}", post(activate_one_click))
