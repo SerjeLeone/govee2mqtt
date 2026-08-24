@@ -1236,6 +1236,8 @@ pub struct OneClickComponent {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(debug_assertions, serde(deny_unknown_fields))]
 pub struct OneClick {
+    #[serde(default)]
+    pub component_id: Option<i64>,
     pub name: String,
     pub plan_type: i64,
     pub preset_id: i64,
@@ -1250,6 +1252,10 @@ pub struct OneClick {
     pub group_name: String,
     #[serde(default)]
     pub iot_rules: Vec<OneClickIotRule>,
+    #[serde(default)]
+    pub action_type: Option<i64>,
+    #[serde(default)]
+    pub all_sort: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1258,6 +1264,8 @@ pub struct OneClick {
 pub struct OneClickIotRule {
     pub device_obj: OneClickIotRuleDevice,
     pub rule: Vec<OneClickIotRuleEntry>,
+    #[serde(default)]
+    pub cmd_group: i64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1272,6 +1280,7 @@ pub struct OneClickIotRuleEntry {
     pub device_type: u32,
     #[serde(deserialize_with = "embedded_json", serialize_with = "as_json")]
     pub iot_msg: JsonValue,
+    pub effect: Option<JsonValue>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1322,6 +1331,7 @@ pub struct OneClickIotRuleDevice {
     pub version_soft: Option<String>,
     pub wifi_soft_version: Option<String>,
     pub wifi_hard_version: Option<String>,
+    pub segment_count: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1483,6 +1493,8 @@ pub struct DeviceSettings {
     /// eg: Glide Hexa. Value is base64 encoded data
     pub shapes: Option<String>,
     pub support_ble_broad_v3: Option<bool>,
+    pub support_enc: Option<bool>,
+    pub mac: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
