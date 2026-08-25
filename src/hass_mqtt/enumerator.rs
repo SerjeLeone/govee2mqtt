@@ -194,12 +194,19 @@ pub async fn enumerate_entities_for_device<'a>(
     if d.supports_rgb() || d.get_color_temperature_range().is_some() || d.supports_brightness() {
         entities.add(DeviceLight::for_device(&d, state, None).await?);
     } else if let DeviceType::Other(ref other) = d.device_type() {
-        log::info!(
-            "Device {d} has unknown type '{other}'. \
-             Exposing available capabilities (switches, sensors). \
-             Use /api/device/{id}/inspect to see full device data.",
-            id = crate::service::hass::topic_safe_id(d),
-        );
+        // Virtual Platform API objects such as BaseGroup are expected to use
+        // the placeholder type NONE. They are handled by the virtual-control
+        // layer, so repeatedly reporting them as unknown devices is misleading.
+        let is_expected_virtual_none = other.eq_ignore_ascii_case("NONE")
+            && crate::service::virtual_controls::VirtualDeviceKind::from_sku(&d.sku).is_some();
+        if !is_expected_virtual_none {
+            log::info!(
+                "Device {d} has unknown type '{other}'. \
+                 Exposing available capabilities (switches, sensors). \
+                 Use /api/device/{id}/inspect to see full device data.",
+                id = crate::service::hass::topic_safe_id(d),
+            );
+        }
     }
 
     if matches!(
