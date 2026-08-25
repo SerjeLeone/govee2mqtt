@@ -1035,8 +1035,10 @@ impl GoveeUndocumentedApi {
             CacheGetOptions {
                 topic: "undoc-api",
                 key: "one-click-shortcuts",
-                soft_ttl: ONE_DAY,
-                hard_ttl: ONE_WEEK,
+                // Group and DreamView membership can change while the bridge
+                // is running, so refresh topology more often than scene media.
+                soft_ttl: FIFTEEN_MINS,
+                hard_ttl: ONE_DAY,
                 negative_ttl: Duration::from_secs(1),
                 allow_stale: true,
             },

@@ -10,6 +10,10 @@ use crate::service::coordinator::Coordinator;
 use crate::service::device::Device;
 use crate::service::hass::{topic_safe_id, topic_safe_string, HassClient};
 use crate::service::iot::IotClient;
+use crate::service::virtual_controls::{
+    aggregate_virtual_state, definition_matches_device, VirtualControlDefinition,
+    VirtualDeviceKind,
+};
 use crate::temperature::{TemperatureScale, TemperatureValue};
 use crate::undoc_api::{GoveeUndocumentedApi, LightEffectCategory};
 use anyhow::Context;
@@ -54,6 +58,7 @@ pub struct State {
     hass_discovery_prefix: Mutex<String>,
     temperature_scale: Mutex<TemperatureScale>,
     lan_cloud_fallback: Mutex<CloudFallbackTransport>,
+    virtual_controls: Mutex<Vec<VirtualControlDefinition>>,
     pub event_bus: crate::service::event_bus::EventBus,
     /// Govee official MQTT push stats
     pub push_connected: std::sync::atomic::AtomicBool,
@@ -73,6 +78,7 @@ impl Default for State {
             hass_discovery_prefix: Default::default(),
             temperature_scale: Default::default(),
             lan_cloud_fallback: Default::default(),
+            virtual_controls: Default::default(),
             event_bus: crate::service::event_bus::EventBus::new(),
             push_connected: std::sync::atomic::AtomicBool::new(false),
             push_event_count: std::sync::atomic::AtomicU64::new(0),
@@ -146,6 +152,108 @@ impl State {
 
     pub async fn get_lan_cloud_fallback(&self) -> CloudFallbackTransport {
         *self.lan_cloud_fallback.lock().await
+    }
+
+    pub async fn set_virtual_controls(&self, controls: Vec<VirtualControlDefinition>) {
+        log::info!(
+            "Loaded topology for {} virtual group/scene controls",
+            controls.len()
+        );
+        *self.virtual_controls.lock().await = controls;
+    }
+
+    pub async fn virtual_control_for_device(
+        &self,
+        device: &Device,
+    ) -> Option<VirtualControlDefinition> {
+        let kind = VirtualDeviceKind::from_sku(&device.sku)?;
+        let selected = {
+            let definitions = self.virtual_controls.lock().await;
+            let candidates: Vec<_> = definitions
+                .iter()
+                .filter(|definition| definition.kind == kind)
+                .collect();
+
+            candidates
+                .iter()
+                .find(|definition| definition_matches_device(definition, device))
+                .map(|definition| (**definition).clone())
+                // Some API generations omit a usable group ID. A unique
+                // control of the same semantic kind is still unambiguous.
+                .or_else(|| (candidates.len() == 1).then(|| (*candidates[0]).clone()))
+        };
+        // A locally configured group with the same ID or name is a useful
+        // secondary source of membership for a matching Platform BaseGroup.
+        let local_group = if kind == VirtualDeviceKind::BaseGroup {
+            let mut matching_group = None;
+            for (id, group) in crate::service::device_config::get_groups() {
+                if id.eq_ignore_ascii_case(&device.id)
+                    || id.eq_ignore_ascii_case(&device.name())
+                    || group.name.eq_ignore_ascii_case(&device.name())
+                {
+                    matching_group = Some(VirtualControlDefinition {
+                        kind,
+                        ids: vec![id],
+                        name: group.name,
+                        member_ids: group.members,
+                    });
+                    break;
+                }
+            }
+            matching_group
+        } else {
+            None
+        };
+
+        if let Some(mut selected) = selected {
+            if selected.member_ids.is_empty() {
+                if let Some(local_group) = local_group {
+                    selected.member_ids = local_group.member_ids;
+                }
+            }
+            return Some(selected);
+        }
+
+        local_group
+    }
+
+    /// State for a physical device, or an aggregate of every known member for
+    /// a virtual BaseGroup/DreamView scene. Unknown membership stays unknown;
+    /// it is never silently converted to OFF.
+    pub async fn effective_device_state(
+        &self,
+        device: &Device,
+    ) -> Option<crate::service::device::DeviceState> {
+        if VirtualDeviceKind::from_sku(&device.sku).is_none() {
+            return device.device_state();
+        }
+
+        let Some(definition) = self.virtual_control_for_device(device).await else {
+            return device.device_state();
+        };
+        let devices = self.devices_by_id.lock().await;
+        aggregate_virtual_state(&definition, &devices).or_else(|| device.device_state())
+    }
+
+    pub async fn virtual_devices_for_member(&self, member_id: &str) -> Vec<Device> {
+        let devices = self.devices().await;
+        let mut result = vec![];
+        for device in devices {
+            if VirtualDeviceKind::from_sku(&device.sku).is_none() {
+                continue;
+            }
+            let Some(definition) = self.virtual_control_for_device(&device).await else {
+                continue;
+            };
+            if definition
+                .member_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(member_id))
+            {
+                result.push(device);
+            }
+        }
+        result
     }
 
     pub async fn set_hass_disco_prefix(&self, prefix: String) {
@@ -466,6 +574,58 @@ impl State {
             );
         }
         Ok(false)
+    }
+
+    /// Independently verify per-device cloud reachability without changing
+    /// normal LAN-first polling decisions. Cached account-list online flags
+    /// are stale for many devices, so only live IoT traffic, a direct Platform
+    /// response, or its explicit "Device is offline" result is authoritative.
+    pub async fn probe_platform_cloud_status(
+        self: &Arc<Self>,
+        device: &Device,
+    ) -> anyhow::Result<bool> {
+        if VirtualDeviceKind::from_sku(&device.sku).is_some()
+            || matches!(device.device_type(), DeviceType::Other(_))
+        {
+            return Ok(false);
+        }
+
+        let Some(client) = self.get_platform_client().await else {
+            return Ok(false);
+        };
+        let Some(info) = &device.http_device_info else {
+            return Ok(false);
+        };
+
+        self.device_mut(&device.sku, &device.id)
+            .await
+            .mark_cloud_probe_attempt();
+
+        match client.get_device_state(info).await {
+            Ok(http_state) => {
+                // This probe exists only to establish reachability. Do not
+                // replace a fresher/preferred LAN state with cloud data.
+                self.device_mut(&device.sku, &device.id)
+                    .await
+                    .observe_http_device_state(&http_state);
+                Ok(true)
+            }
+            Err(err) => {
+                let explicitly_offline = HttpRequestFailed::from_err(&err)
+                    .map(|http_err| {
+                        http_err.content_contains("Device is offline")
+                            || http_err.content_contains("device is offline")
+                    })
+                    .unwrap_or(false);
+                if explicitly_offline {
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_cloud_online(false);
+                    return Ok(true);
+                }
+                Err(err).context("probe Platform cloud status")
+            }
+        }
     }
 
     async fn poll_lan_api<F: Fn(&LanDeviceStatus) -> bool>(
@@ -1080,6 +1240,54 @@ impl State {
             return;
         };
 
+        if VirtualDeviceKind::from_sku(&device.sku).is_some() {
+            let Some(definition) = self.virtual_control_for_device(&device).await else {
+                log::warn!(
+                    "Cannot refresh {device} after control because its member topology is unknown"
+                );
+                return;
+            };
+
+            // The Platform API cannot poll BaseGroup/DreamViewScenic objects.
+            // Refresh their real members instead so aggregate state converges
+            // promptly after a successful group command.
+            sleep(Duration::from_secs(2)).await;
+            log::info!("Polling members of {device} to refresh aggregate state after control");
+            for member_id in definition.member_ids {
+                let Some(member) = self.resolve_device(&member_id).await else {
+                    log::debug!("Virtual control {device} references unknown member {member_id}");
+                    continue;
+                };
+                if let Some(lan_device) = &member.lan_device {
+                    if let Err(err) = self.poll_lan_api(lan_device, |_| true).await {
+                        log::warn!("Polling {member} via LAN after group control failed: {err:#}");
+                    }
+                } else {
+                    match self.poll_platform_api(&member).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(err) = self.poll_iot_api(&member).await {
+                                log::warn!(
+                                    "Polling {member} via IoT after group control failed: {err:#}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Polling {member} via Platform after group control failed: {err:#}"
+                            );
+                            if let Err(err) = self.poll_iot_api(&member).await {
+                                log::warn!(
+                                    "Polling {member} via IoT after Platform failure failed: {err:#}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let iot_available = self.get_iot_client().await.is_some();
 
         if device.pollable_via_iot() && iot_available {
@@ -1621,6 +1829,29 @@ impl State {
 
             hass.advise_hass_of_light_state(&canonical_device, self)
                 .await?;
+
+            // Virtual Platform controls derive their switch state from member
+            // devices, so member updates must refresh those switch topics too.
+            for virtual_device in self.virtual_devices_for_member(device_id).await {
+                hass.advise_hass_of_light_state(&virtual_device, self)
+                    .await?;
+            }
+
+            // Keep locally configured MQTT group entities synchronized for the
+            // same reason. They are not part of devices_by_id and therefore do
+            // not receive the normal per-device notification automatically.
+            for (group_id, group) in crate::service::device_config::get_groups() {
+                if group
+                    .members
+                    .iter()
+                    .any(|member| member.eq_ignore_ascii_case(device_id))
+                {
+                    let entity =
+                        crate::hass_mqtt::group_light::GroupLight::new(&group_id, &group, self);
+                    crate::hass_mqtt::instance::EntityInstance::notify_state(&entity, &hass)
+                        .await?;
+                }
+            }
         }
 
         Ok(())

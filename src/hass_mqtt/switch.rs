@@ -94,7 +94,7 @@ impl EntityInstance for CapabilitySwitch {
         };
 
         if self.instance_name == "powerSwitch" {
-            if let Some(state) = device.device_state() {
+            if let Some(state) = self.state.effective_device_state(&device).await {
                 client
                     .publish(
                         &self.switch.state_topic,

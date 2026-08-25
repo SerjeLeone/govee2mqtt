@@ -18,3 +18,4 @@ pub mod quirks;
 pub mod scene_database;
 pub mod state;
 pub mod timezone;
+pub mod virtual_controls;

@@ -81,9 +81,11 @@ impl EntityInstance for GroupLight {
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
-        // Aggregate state from all members: use first member's state as representative.
-        // If any member is ON, group is ON. Brightness = average. Color = first member.
-        let mut any_on = false;
+        // A group is ON only when every configured member has a known ON
+        // state. This also makes an incomplete group actionable: one OFF
+        // member keeps the group switch OFF so toggling it turns all members
+        // on. Brightness is averaged and color comes from the first member.
+        let mut all_on = !self.member_ids.is_empty();
         let mut brightness_sum = 0u32;
         let mut brightness_count = 0u32;
         let mut color = None;
@@ -92,20 +94,22 @@ impl EntityInstance for GroupLight {
         for member_id in &self.member_ids {
             if let Some(device) = self.state.device_by_id(member_id).await {
                 if let Some(ds) = device.device_state() {
-                    if ds.on {
-                        any_on = true;
-                    }
+                    all_on &= ds.on;
                     brightness_sum += ds.brightness as u32;
                     brightness_count += 1;
                     if color.is_none() {
                         color = Some(ds.color);
                         kelvin = ds.kelvin;
                     }
+                } else {
+                    all_on = false;
                 }
+            } else {
+                all_on = false;
             }
         }
 
-        let state_str = if any_on { "ON" } else { "OFF" };
+        let state_str = if all_on { "ON" } else { "OFF" };
         let avg_brightness = if brightness_count > 0 {
             brightness_sum / brightness_count
         } else {
@@ -114,7 +118,7 @@ impl EntityInstance for GroupLight {
 
         let mut payload = Map::new();
         payload.insert("state".to_string(), json!(state_str));
-        if any_on {
+        if all_on {
             payload.insert("brightness".to_string(), json!(avg_brightness));
             if let Some(c) = color {
                 if kelvin == 0 {

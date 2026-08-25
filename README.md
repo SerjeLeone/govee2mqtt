@@ -30,7 +30,8 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 * Per-device and per-segment color control via LAN.
 * Device grouping — control multiple devices as one light entity.
 * Per-device configuration overrides via JSON file (names, color temp, icons, rooms).
-* Web UI with device controls, live log viewer, and bridge status dashboard.
+* Web UI with physical-device controls, separate group/DreamView-scene controls,
+  a dedicated hardware DreamView switch, live logs, and bridge status.
 * Native Home Assistant fan entities, air-quality sensors, and diagnostic
   battery/Wi-Fi sensors for supported devices.
 * Bounded LAN retries and a per-device polling circuit breaker for congested or

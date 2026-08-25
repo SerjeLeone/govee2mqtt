@@ -115,6 +115,32 @@ async fn poll_single_device(state: &StateHandle, device: &Device) -> anyhow::Res
     Ok(())
 }
 
+/// Probe cloud reachability independently from state polling. Keeping this in
+/// its own sequential loop ensures a slow cloud request can never delay LAN
+/// status or local control, and spaces requests out to avoid API bursts.
+async fn periodic_cloud_status_probe(state: StateHandle) {
+    // Let initial LAN discovery and the first local state poll settle before
+    // checking the optional secondary transport.
+    sleep(Duration::from_secs(25)).await;
+
+    loop {
+        let now = Utc::now();
+        for device in state.devices().await {
+            if device.cloud_probe_due(now, chrono::Duration::minutes(15)) {
+                match state.probe_platform_cloud_status(&device).await {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(err) => {
+                        log::warn!("Unable to verify cloud status for {device}: {err:#}");
+                    }
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+        sleep(Duration::from_secs(60)).await;
+    }
+}
+
 async fn periodic_state_poll(
     state: StateHandle,
     extensions: Arc<ExtensionManager>,
@@ -168,6 +194,33 @@ async fn enumerate_devices_via_platform_api(
     Ok(())
 }
 
+async fn refresh_virtual_control_topology(
+    state: StateHandle,
+    client: GoveeUndocumentedApi,
+) {
+    let topology = async {
+        let community_token = client.login_community().await?;
+        client
+            .get_saved_one_click_shortcuts(&community_token)
+            .await
+    }
+    .await;
+    match topology {
+        Ok(components) => {
+            state
+                .set_virtual_controls(
+                    crate::service::virtual_controls::parse_virtual_controls(&components),
+                )
+                .await;
+        }
+        Err(err) => {
+            // Group topology improves aggregate state but is not required for
+            // physical-device discovery or local control.
+            log::warn!("Unable to refresh virtual group/DreamView topology: {err:#}");
+        }
+    }
+}
+
 async fn enumerate_devices_via_undo_api(
     state: StateHandle,
     client: Option<GoveeUndocumentedApi>,
@@ -197,6 +250,10 @@ async fn enumerate_devices_via_undo_api(
     if needs_start {
         start_iot_client(args, state.clone(), Some(acct)).await?;
     }
+    // This optional cloud lookup can take tens of seconds during an outage.
+    // Run it independently so physical discovery and LAN control are never
+    // blocked by virtual group/scene topology.
+    tokio::spawn(refresh_virtual_control_topology(state, client));
     Ok(())
 }
 
@@ -478,6 +535,11 @@ impl ServeCommand {
                     log::error!("periodic_state_poll: {err:#}");
                 }
             });
+        }
+
+        {
+            let state = state.clone();
+            tokio::spawn(periodic_cloud_status_probe(state));
         }
 
         spawn_hass_integration(state.clone(), &args.hass_args).await?;

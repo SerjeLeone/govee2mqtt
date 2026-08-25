@@ -79,6 +79,17 @@ export class DeviceList extends LitElement {
     this._apiAction(`api/device/${id}/power/${power}`, `${name} ${power}`);
   }
 
+  _set_dreamview(e) {
+    e.stopPropagation();
+    const id = encodeURIComponent(e.target.dataset.id);
+    const name = e.target.dataset.name || id;
+    const enabled = e.target.checked ? 'on' : 'off';
+    this._apiAction(
+      `api/device/${id}/dreamview/${enabled}`,
+      `${name} DreamView ${enabled}`,
+    );
+  }
+
   _set_color(e) {
     e.stopPropagation();
     const id = encodeURIComponent(e.target.dataset.id);
@@ -160,6 +171,13 @@ export class DeviceList extends LitElement {
                   <dl class="row mb-0" style="font-size:0.9em">
                     <dt class="col-4">ID</dt><dd class="col-8"><code style="font-size:0.85em">${data.id || item.id}</code></dd>
                     <dt class="col-4">Model</dt><dd class="col-8">${data.sku || item.sku}</dd>
+                    ${item.is_virtual ? html`
+                      <dt class="col-4">Type</dt><dd class="col-8">
+                        ${item.virtual_kind === 'dream_view_scene' ? 'DreamView scene' : 'Group control'}
+                      </dd>
+                      <dt class="col-4">Members</dt><dd class="col-8">
+                        ${item.virtual_member_count ?? 'Unknown'}
+                      </dd>` : ''}
                     <dt class="col-4">Room</dt><dd class="col-8">${data.room || 'Not assigned'}</dd>
                     ${data.active_scene ? html`<dt class="col-4">Scene</dt><dd class="col-8"><span class="badge bg-primary">${data.active_scene}</span></dd>` : ''}
                   </dl>
@@ -234,7 +252,7 @@ export class DeviceList extends LitElement {
     } catch (_) { /* persistence is optional */ }
   }
 
-  _status_summary(devices) {
+  _status_summary(devices, virtualControls) {
     const mqttConfigured = devices.some((item) => item.mqtt_configured);
     const apiCount = devices.filter((item) => item.api_metadata).length;
     const lanCount = devices.filter((item) => item.lan_discovered).length;
@@ -243,6 +261,11 @@ export class DeviceList extends LitElement {
         ${this._render_badge('MQTT configured', mqttConfigured)}
         <span class="badge rounded-pill text-bg-info">API metadata: ${apiCount}</span>
         <span class="badge rounded-pill text-bg-info">LAN discovered: ${lanCount}</span>
+        ${virtualControls.length > 0
+          ? html`<span class="badge rounded-pill text-bg-secondary">
+              Group/scene controls: ${virtualControls.length}
+            </span>`
+          : ''}
         <label class="form-check form-switch device-availability-filter mb-0"
                title="Hide devices that have not answered through LAN or cloud">
           <input class="form-check-input" type="checkbox" role="switch"
@@ -274,8 +297,8 @@ export class DeviceList extends LitElement {
     const updated = hasState ? timeAgo(new Date(item.state.updated)) : '';
     const source = item.state?.source || '';
 
-    const scenes = this.scenesCache[item.safe_id] || [];
-    if (!this.scenesCache[item.safe_id]) this._loadScenes(item.safe_id);
+    const scenes = item.is_virtual ? [] : (this.scenesCache[item.safe_id] || []);
+    if (!item.is_virtual && !this.scenesCache[item.safe_id]) this._loadScenes(item.safe_id);
     const active_scene = item.state?.scene || '';
 
     const isExpanded = this.expandedDevice === item.safe_id;
@@ -288,9 +311,23 @@ export class DeviceList extends LitElement {
           <strong>${item.name}</strong>
           ${item.room ? html`<br><small class="text-muted">${item.room}</small>` : ''}
           <div class="d-flex flex-wrap gap-1 mt-1">
-            ${this._render_badge('API', item.api_metadata)}
-            ${this._render_badge('LAN', item.lan_discovered)}
-            ${this._render_cloud_badge(item)}
+            ${item.is_virtual
+              ? html`
+                  <span class="badge rounded-pill text-bg-info">
+                    ${item.virtual_kind === 'dream_view_scene' ? 'DreamView scene' : 'Group'}
+                  </span>
+                  <span class="badge rounded-pill text-bg-secondary">Platform control</span>
+                  ${item.virtual_member_count != null
+                    ? html`<span class="badge rounded-pill text-bg-secondary">
+                        ${item.virtual_member_count} member${item.virtual_member_count !== 1 ? 's' : ''}
+                      </span>`
+                    : ''}
+                `
+              : html`
+                  ${this._render_badge('API', item.api_metadata)}
+                  ${this._render_badge('LAN', item.lan_discovered)}
+                `}
+            ${item.is_virtual ? '' : this._render_cloud_badge(item)}
           </div>
         </td>
         <td class="gv-device-controls" @click=${(e) => e.stopPropagation()}>
@@ -298,15 +335,19 @@ export class DeviceList extends LitElement {
             <span class="form-switch mb-0">
               <input data-id=${item.safe_id} data-name=${item.name}
                 class="form-check-input" type="checkbox" role="switch"
-                @click=${this._set_power_on} ?checked=${isOn}>
+                @click=${this._set_power_on} ?checked=${isOn}
+                .indeterminate=${!hasState}
+                title=${hasState ? 'Power' : 'Power state is not known yet'}>
             </span>
-            <div class="d-flex align-items-center gap-1">
-              <input type="range" class="form-range" style="width:80px" min="0" max="100"
-                data-id=${item.safe_id} @change=${this._set_brightness} value=${brightness}>
-              <span class="gv-brightness-label">${brightness}%</span>
-            </div>
-            <input class="form-control form-control-color p-0 border-0" style="width:28px;height:28px"
-              data-id=${item.safe_id} @change=${this._set_color} type="color" value=${rgb_hex}>
+            ${item.supports_brightness ? html`
+              <div class="d-flex align-items-center gap-1">
+                <input type="range" class="form-range" style="width:80px" min="0" max="100"
+                  data-id=${item.safe_id} @change=${this._set_brightness} value=${brightness}>
+                <span class="gv-brightness-label">${brightness}%</span>
+              </div>` : ''}
+            ${item.supports_rgb ? html`
+              <input class="form-control form-control-color p-0 border-0" style="width:28px;height:28px"
+                data-id=${item.safe_id} @change=${this._set_color} type="color" value=${rgb_hex}>` : ''}
             ${scenes.length > 0 ? html`
               <select class="form-select form-select-sm gv-scene-select"
                 data-id=${item.safe_id} data-name=${item.name}
@@ -316,6 +357,16 @@ export class DeviceList extends LitElement {
                   <option value=${s} ?selected=${s === active_scene}>${s}</option>
                 `)}
               </select>` : ''}
+            ${item.supports_dreamview ? html`
+              <label class="form-check form-switch d-flex align-items-center gap-1 mb-0 gv-dreamview-control"
+                     title="LAN-first hardware DreamView control">
+                <input class="form-check-input mt-0" type="checkbox" role="switch"
+                  data-id=${item.safe_id} data-name=${item.name}
+                  @click=${this._set_dreamview}
+                  ?checked=${item.dreamview_enabled === true}
+                  .indeterminate=${item.dreamview_enabled == null}>
+                <span class="small">DreamView</span>
+              </label>` : ''}
           </div>
         </td>
         <td class="text-end d-none d-md-table-cell">
@@ -339,40 +390,49 @@ export class DeviceList extends LitElement {
         </div>`;
     }
 
+    const physicalDevices = devices.filter((item) => !item.is_virtual);
+    const virtualControls = devices.filter((item) => item.is_virtual);
     const visibleDevices = this.hideUnavailable
-      ? devices.filter((item) => item.available)
-      : devices;
+      ? physicalDevices.filter((item) => item.available)
+      : physicalDevices;
+    const visibleVirtualControls = this.hideUnavailable
+      ? virtualControls.filter((item) => item.available)
+      : virtualControls;
+    const renderSection = (title, items, firstColumn = 'Device') => items.length > 0 ? html`
+      <section class="device-room-section mb-4">
+        <h2>${title}</h2>
+        <div class="gv-table-wrap">
+          <table class="table table-hover align-middle mb-2">
+            <thead>
+              <tr>
+                <th>${firstColumn}</th>
+                <th>Controls</th>
+                <th class="text-end d-none d-md-table-cell">Status</th>
+              </tr>
+            </thead>
+            <tbody>${items.map(this._render_item)}</tbody>
+          </table>
+        </div>
+      </section>` : '';
 
     return html`
-      ${this._status_summary(devices)}
+      ${this._status_summary(physicalDevices, virtualControls)}
       ${visibleDevices.length === 0
         ? html`<div class="alert alert-secondary">
             All unavailable devices are hidden. Turn off <strong>Hide unavailable</strong>
             to inspect them.
           </div>`
         : ''}
+      ${renderSection('Groups & scenes', visibleVirtualControls, 'Group or scene')}
       ${this._room_groups(visibleDevices).map(([room, items]) => html`
-        <section class="device-room-section mb-4">
-          <h2>${room}</h2>
-          <div class="gv-table-wrap">
-            <table class="table table-hover align-middle mb-2">
-              <thead>
-                <tr>
-                  <th>Device</th>
-                  <th>Controls</th>
-                  <th class="text-end d-none d-md-table-cell">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${items.map(this._render_item)}
-              </tbody>
-            </table>
-          </div>
-        </section>`)}
+        ${renderSection(room, items)}`)}
       <small class="text-muted">
-        ${visibleDevices.length === devices.length
-          ? `${devices.length} device${devices.length !== 1 ? 's' : ''}`
-          : `${visibleDevices.length} of ${devices.length} devices shown`}.
+        ${visibleDevices.length === physicalDevices.length
+          ? `${physicalDevices.length} device${physicalDevices.length !== 1 ? 's' : ''}`
+          : `${visibleDevices.length} of ${physicalDevices.length} devices shown`}.
+        ${virtualControls.length > 0
+          ? `${visibleVirtualControls.length} of ${virtualControls.length} group/scene controls shown.`
+          : ''}
         Click a row for details.
       </small>`;
   }

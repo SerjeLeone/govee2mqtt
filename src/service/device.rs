@@ -42,6 +42,7 @@ pub struct Device {
     /// state must not erase a valid cloud status in the Web UI.
     cloud_online: Option<bool>,
     last_cloud_status_update: Option<DateTime<Utc>>,
+    last_cloud_probe_attempt: Option<DateTime<Utc>>,
 
     /// When an IoT packet last carried an explicit `state.mode`.
     /// `last_iot_device_status_update` is re-stamped by every IoT packet,
@@ -261,6 +262,20 @@ impl Device {
         self.cloud_online
     }
 
+    pub fn cloud_probe_due(&self, now: DateTime<Utc>, interval: chrono::Duration) -> bool {
+        self.last_cloud_probe_attempt
+            .iter()
+            .chain(self.last_cloud_status_update.iter())
+            .max()
+            .cloned()
+            .map(|last| now - last >= interval)
+            .unwrap_or(true)
+    }
+
+    pub fn mark_cloud_probe_attempt(&mut self) {
+        self.last_cloud_probe_attempt = Some(Utc::now());
+    }
+
     pub fn ip_addr(&self) -> Option<IpAddr> {
         self.lan_device.as_ref().map(|device| device.ip)
     }
@@ -353,7 +368,10 @@ impl Device {
         self.last_http_device_update.replace(Utc::now());
     }
 
-    pub fn set_http_device_state(&mut self, state: HttpDeviceState) {
+    /// Record connectivity and independently reported feature toggles from a
+    /// Platform state response without changing the preferred device-state
+    /// transport. Used by the background cloud-status probe for LAN devices.
+    pub fn observe_http_device_state(&mut self, state: &HttpDeviceState) {
         let cloud_online = state
             .capability_by_instance("online")
             .and_then(|cap| cap.state.pointer("/value").and_then(|value| value.as_bool()))
@@ -367,9 +385,13 @@ impl Device {
         {
             self.set_dreamview_enabled(enabled);
         }
+        self.set_cloud_online(cloud_online);
+    }
+
+    pub fn set_http_device_state(&mut self, state: HttpDeviceState) {
+        self.observe_http_device_state(&state);
         self.http_device_state.replace(state);
         self.last_http_device_state_update.replace(Utc::now());
-        self.set_cloud_online(cloud_online);
         self.clear_scene_if_light_powered_off(self.compute_http_device_state());
     }
 
@@ -378,15 +400,15 @@ impl Device {
         entry: crate::undoc_api::DeviceEntry,
         room_name: Option<&str>,
     ) {
-        let cloud_online = entry.device_ext.last_device_data.online;
         self.undoc_device_info.replace(UndocDeviceInfo {
             entry,
             room_name: room_name.map(|s| s.to_string()),
         });
         self.last_undoc_device_info_update.replace(Utc::now());
-        if let Some(online) = cloud_online {
-            self.set_cloud_online(online);
-        }
+        // The account device-list endpoint frequently carries a stale
+        // `lastDeviceData.online` value in either direction. Cloud status is
+        // therefore learned only from a live IoT message or a direct Platform
+        // state/control response, never from this cached account metadata.
     }
 
     pub fn compute_iot_device_state(&self) -> Option<DeviceState> {
@@ -967,6 +989,34 @@ mod tests {
 
         assert_eq!(device.dreamview_enabled(), Some(false));
     }
+
+    #[test]
+    fn cloud_probe_observation_does_not_replace_lan_state() {
+        let mut device = Device::new("H66A1", "aa:bb");
+        device.set_lan_device_status(LanDeviceStatus {
+            on: true,
+            brightness: 80,
+            color: DeviceColor { r: 1, g: 2, b: 3 },
+            color_temperature_kelvin: 4000,
+            mode: None,
+        });
+        let platform_state = HttpDeviceState {
+            sku: "H66A1".to_string(),
+            device: "aa:bb".to_string(),
+            capabilities: vec![DeviceCapabilityState {
+                kind: DeviceCapabilityKind::Toggle,
+                instance: "dreamViewToggle".to_string(),
+                state: json!({"value": 1}),
+            }],
+        };
+
+        device.observe_http_device_state(&platform_state);
+
+        assert_eq!(device.device_state().unwrap().source, "LAN API");
+        assert_eq!(device.cloud_online(), Some(true));
+        assert_eq!(device.dreamview_enabled(), Some(true));
+        assert!(device.http_device_state.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1033,6 +1083,21 @@ mod test {
     }
 
     #[test]
+    fn cloud_probe_is_rate_limited_independently_from_state_polling() {
+        let mut device = Device::new("H6000", "aa:bb");
+        let now = Utc::now();
+        let interval = chrono::Duration::minutes(15);
+
+        assert!(device.cloud_probe_due(now.clone(), interval));
+        device.mark_cloud_probe_attempt();
+        assert!(!device.cloud_probe_due(now.clone(), interval));
+        assert!(device.cloud_probe_due(
+            now + interval + chrono::Duration::seconds(1),
+            interval
+        ));
+    }
+
+    #[test]
     fn recent_lan_response_remains_available_when_cloud_is_offline() {
         let mut device = Device::new("H6000", "aa:bb");
         device.last_lan_device_status_update = Some(Utc::now());
@@ -1079,17 +1144,38 @@ mod test {
     }
 
     #[test]
-    fn undocumented_account_status_populates_cloud_status() {
+    fn undocumented_account_offline_status_is_not_authoritative() {
         let resp: crate::undoc_api::DevicesResponse =
             crate::platform_api::from_json(include_str!("../../test-data/undoc-device-list.json"))
                 .unwrap();
-        let entry = resp.devices.into_iter().next().unwrap();
-        let expected = entry.device_ext.last_device_data.online;
+        let entry = resp
+            .devices
+            .into_iter()
+            .find(|entry| entry.device_ext.last_device_data.online == Some(false))
+            .unwrap();
         let mut device = Device::new(&entry.sku, &entry.device);
 
         device.set_undoc_device_info(entry, None);
 
-        assert_eq!(device.cloud_online(), expected);
+        assert_eq!(device.cloud_online(), None);
+    }
+
+    #[test]
+    fn undocumented_account_online_status_is_not_authoritative() {
+        let resp: crate::undoc_api::DevicesResponse = crate::platform_api::from_json(include_str!(
+            "../../test-data/undoc-device-list-issue-21.json"
+        ))
+        .unwrap();
+        let entry = resp
+            .devices
+            .into_iter()
+            .find(|entry| entry.device_ext.last_device_data.online == Some(true))
+            .unwrap();
+        let mut device = Device::new(&entry.sku, &entry.device);
+
+        device.set_undoc_device_info(entry, None);
+
+        assert_eq!(device.cloud_online(), None);
     }
 
     #[test]

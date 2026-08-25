@@ -3,6 +3,7 @@ use crate::service::coordinator::Coordinator;
 use crate::service::device::{Device, DeviceState};
 use crate::service::hass::topic_safe_string;
 use crate::service::state::{sort_and_dedup_scenes, StateHandle};
+use crate::service::virtual_controls::VirtualDeviceKind;
 use crate::undoc_api::LightEffectCategory;
 use anyhow::Context;
 use axum::extract::{ConnectInfo, Path, State};
@@ -159,44 +160,75 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         pub cloud_supported: bool,
         pub cloud_status_observable: bool,
         pub cloud_online: Option<bool>,
+        pub is_virtual: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub virtual_kind: Option<VirtualDeviceKind>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub virtual_member_count: Option<usize>,
+        pub supports_brightness: bool,
+        pub supports_rgb: bool,
+        pub supports_dreamview: bool,
+        pub dreamview_enabled: Option<bool>,
     }
 
     let now = chrono::Utc::now();
-    let devices: Vec<_> = devices
-        .into_iter()
-        .map(|d| {
-            let device_state = d.device_state();
-            let cloud_online = d.cloud_online();
-            let ip = d.ip_addr();
-            let cloud_supported = d.http_device_info.is_some() || d.iot_api_supported();
-            // Govee exposes groups and similar virtual controls as type
-            // `Other`. The API accepts control commands for them but rejects
-            // state polling, so an online/offline state cannot be queried.
-            let cloud_status_observable = !matches!(d.device_type(), DeviceType::Other(_));
-            let available = d.is_online(now)
+    let mut result = Vec::with_capacity(devices.len());
+    for d in devices {
+        let virtual_kind = VirtualDeviceKind::from_sku(&d.sku);
+        let is_virtual = virtual_kind.is_some();
+        let device_state = state.effective_device_state(&d).await;
+        let virtual_member_count = if is_virtual {
+            state
+                .virtual_control_for_device(&d)
+                .await
+                .map(|definition| definition.member_ids.len())
+        } else {
+            None
+        };
+        let cloud_online = d.cloud_online();
+        let ip = d.ip_addr();
+        let cloud_supported = d.http_device_info.is_some() || d.iot_api_supported();
+        // Govee exposes groups and similar virtual controls as type `Other`.
+        // The API accepts control commands for them but rejects state polling.
+        let cloud_status_observable = !is_virtual
+            && !matches!(d.device_type(), DeviceType::Other(_));
+        let available = if is_virtual {
+            device_state.is_some()
                 || (cloud_supported
                     && !cloud_status_observable
-                    && cloud_online != Some(false));
-            DeviceItem {
-                name: d.name(),
-                room: d.room_name().map(|r| r.to_string()),
-                ip,
-                state: device_state,
-                mqtt_configured,
-                api_metadata: d.http_device_info.is_some(),
-                lan_discovered: ip.is_some(),
-                available,
-                cloud_supported,
-                cloud_status_observable,
-                cloud_online,
-                safe_id: topic_safe_string(&d.id),
-                sku: d.sku,
-                id: d.id,
-            }
-        })
-        .collect();
+                    && cloud_online != Some(false))
+        } else {
+            d.is_online(now)
+                || (cloud_supported
+                    && !cloud_status_observable
+                    && cloud_online != Some(false))
+        };
+        result.push(DeviceItem {
+            name: d.name(),
+            room: d.room_name().map(|r| r.to_string()),
+            ip,
+            state: device_state,
+            mqtt_configured,
+            api_metadata: d.http_device_info.is_some(),
+            lan_discovered: ip.is_some(),
+            available,
+            cloud_supported,
+            cloud_status_observable,
+            cloud_online,
+            is_virtual,
+            virtual_kind,
+            virtual_member_count,
+            supports_brightness: !is_virtual && d.supports_brightness(),
+            supports_rgb: !is_virtual && d.supports_rgb(),
+            supports_dreamview: !is_virtual && d.supports_dreamview(),
+            dreamview_enabled: d.dreamview_enabled(),
+            safe_id: topic_safe_string(&d.id),
+            sku: d.sku,
+            id: d.id,
+        });
+    }
 
-    Ok(Json(devices).into_response())
+    Ok(Json(result).into_response())
 }
 
 /// Turns on a given device
@@ -223,6 +255,34 @@ async fn device_power_off(
 
     state
         .device_power_on(&device, false)
+        .await
+        .map_err(generic)?;
+
+    Ok(response_with_code(StatusCode::OK, "ok"))
+}
+
+async fn device_dreamview_on(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let device = resolve_device_for_control(&state, &id).await?;
+
+    state
+        .device_set_dreamview(&device, true)
+        .await
+        .map_err(generic)?;
+
+    Ok(response_with_code(StatusCode::OK, "ok"))
+}
+
+async fn device_dreamview_off(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let device = resolve_device_for_control(&state, &id).await?;
+
+    state
+        .device_set_dreamview(&device, false)
         .await
         .map_err(generic)?;
 
@@ -511,7 +571,7 @@ async fn inspect_device(
         id: device.id.clone(),
         name: device.name(),
         room: device.room_name(),
-        current_state: device.device_state(),
+        current_state: state.effective_device_state(&device).await,
         active_scene: device.active_scene_name().map(str::to_string),
         active_scene_instance: device.active_scene_instance().map(str::to_string),
         platform_device_info,
@@ -589,7 +649,14 @@ async fn health_check(State(state): State<StateHandle>) -> Response {
     let devices = state.devices().await;
     let now = chrono::Utc::now();
     let mut online = 0u32;
+    let mut physical_devices = 0u32;
+    let mut virtual_controls = 0u32;
     for device in &devices {
+        if VirtualDeviceKind::from_sku(&device.sku).is_some() {
+            virtual_controls += 1;
+            continue;
+        }
+        physical_devices += 1;
         let is_online = device.is_online(now);
         if is_online {
             online += 1;
@@ -606,8 +673,9 @@ async fn health_check(State(state): State<StateHandle>) -> Response {
     Json(serde_json::json!({
         "status": "ok",
         "version": crate::version_info::govee_version(),
-        "devices": devices.len(),
+        "devices": physical_devices,
         "devices_online": online,
+        "virtual_controls": virtual_controls,
         "push": {
             "connected": state.push_connected.load(std::sync::atomic::Ordering::Relaxed),
             "events_received": state.push_event_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -663,6 +731,14 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
         .route("/api/devices", get(list_devices))
         .route("/api/device/{id}/power/on", post(device_power_on))
         .route("/api/device/{id}/power/off", post(device_power_off))
+        .route(
+            "/api/device/{id}/dreamview/on",
+            post(device_dreamview_on),
+        )
+        .route(
+            "/api/device/{id}/dreamview/off",
+            post(device_dreamview_off),
+        )
         .route(
             "/api/device/{id}/brightness/{level}",
             post(device_set_brightness),
@@ -905,6 +981,16 @@ mod tests {
                 capabilities: vec![],
             });
         }
+        {
+            let mut group = state.device_mut("BaseGroup", "group-1").await;
+            group.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "BaseGroup".to_string(),
+                device: "group-1".to_string(),
+                device_name: "All lights".to_string(),
+                device_type: crate::platform_api::DeviceType::Other("NONE".to_string()),
+                capabilities: vec![],
+            });
+        }
 
         let app = build_router(state, false);
         let response = app
@@ -922,6 +1008,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["devices"], 1);
+        assert_eq!(json["virtual_controls"], 1);
     }
 
     #[tokio::test]
@@ -955,7 +1042,13 @@ mod tests {
                 device: "AA:BB".to_string(),
                 device_name: "Cloud Lamp".to_string(),
                 device_type: crate::platform_api::DeviceType::Light,
-                capabilities: vec![],
+                capabilities: vec![crate::platform_api::DeviceCapability {
+                    kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+                    instance: "dreamViewToggle".to_string(),
+                    parameters: None,
+                    alarm_type: None,
+                    event_state: None,
+                }],
             });
             device.set_cloud_online(false);
         }
@@ -978,6 +1071,7 @@ mod tests {
         assert_eq!(item["cloud_status_observable"], true);
         assert_eq!(item["cloud_online"], false);
         assert_eq!(item["available"], false);
+        assert_eq!(item["supports_dreamview"], true);
     }
 
     #[tokio::test]
@@ -1012,6 +1106,70 @@ mod tests {
         assert_eq!(item["cloud_status_observable"], false);
         assert_eq!(item["cloud_online"], serde_json::Value::Null);
         assert_eq!(item["available"], true);
+        assert_eq!(item["is_virtual"], true);
+        assert_eq!(item["virtual_kind"], "base_group");
+        assert_eq!(item["supports_brightness"], false);
+        assert_eq!(item["supports_rgb"], false);
+    }
+
+    #[tokio::test]
+    async fn devices_endpoint_aggregates_virtual_group_from_all_members() {
+        let state = StateHandle::default();
+        for id in ["lamp-one", "lamp-two"] {
+            state
+                .device_mut("H6000", id)
+                .await
+                .set_lan_device_status(crate::lan_api::DeviceStatus {
+                    on: true,
+                    brightness: 75,
+                    color: crate::lan_api::DeviceColor { r: 1, g: 2, b: 3 },
+                    color_temperature_kelvin: 4000,
+                    mode: None,
+                });
+        }
+        {
+            let mut group = state.device_mut("BaseGroup", "group-1").await;
+            group.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "BaseGroup".to_string(),
+                device: "group-1".to_string(),
+                device_name: "All lights".to_string(),
+                device_type: crate::platform_api::DeviceType::Other("NONE".to_string()),
+                capabilities: vec![],
+            });
+        }
+        state
+            .set_virtual_controls(vec![
+                crate::service::virtual_controls::VirtualControlDefinition {
+                    kind: VirtualDeviceKind::BaseGroup,
+                    ids: vec!["group-1".to_string()],
+                    name: "All lights".to_string(),
+                    member_ids: vec!["lamp-one".to_string(), "lamp-two".to_string()],
+                },
+            ])
+            .await;
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "group-1")
+            .unwrap();
+
+        assert_eq!(group["state"]["on"], true);
+        assert_eq!(group["state"]["source"], "GROUP AGGREGATE");
+        assert_eq!(group["virtual_member_count"], 2);
     }
 
     #[tokio::test]
