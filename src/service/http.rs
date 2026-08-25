@@ -3,7 +3,7 @@ use crate::service::coordinator::Coordinator;
 use crate::service::device::{Device, DeviceState};
 use crate::service::hass::topic_safe_string;
 use crate::service::state::{sort_and_dedup_scenes, StateHandle};
-use crate::service::virtual_controls::VirtualDeviceKind;
+use crate::service::virtual_controls::{definition_matches_device, VirtualDeviceKind};
 use crate::undoc_api::LightEffectCategory;
 use anyhow::Context;
 use axum::extract::{ConnectInfo, Path, State};
@@ -191,8 +191,14 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         pub active_music_mode: Option<String>,
     }
 
+    let topology = state.virtual_controls().await;
+    let platform_virtual_controls: Vec<_> = devices
+        .iter()
+        .filter(|device| VirtualDeviceKind::from_sku(&device.sku).is_some())
+        .cloned()
+        .collect();
     let now = chrono::Utc::now();
-    let mut result = Vec::with_capacity(devices.len());
+    let mut result = Vec::with_capacity(devices.len() + topology.len());
     for d in devices {
         let virtual_kind = VirtualDeviceKind::from_sku(&d.sku);
         let is_virtual = virtual_kind.is_some();
@@ -251,7 +257,7 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
             virtual_member_count,
             supports_brightness: !is_virtual && d.supports_brightness(),
             supports_rgb: !is_virtual && d.supports_rgb(),
-            supports_dreamview: !is_virtual && d.supports_dreamview(),
+            supports_dreamview: !is_virtual && state.device_supports_dreamview(&d).await,
             dreamview_enabled: d.dreamview_enabled(),
             supports_music_mode: !is_virtual
                 && d.get_capability_by_instance("musicMode").is_some(),
@@ -259,6 +265,62 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
             safe_id: topic_safe_string(&d.id),
             sku: d.sku,
             id: d.id,
+        });
+    }
+
+    // Music DreamView cards are returned by Govee's home-layout API but are
+    // absent from the official Platform device list. Add those saved scenes as
+    // first-class virtual rows while avoiding a duplicate if Govee later starts
+    // returning a matching Platform object.
+    for definition in topology {
+        if definition.kind != VirtualDeviceKind::MusicDreamView
+            || platform_virtual_controls
+                .iter()
+                .any(|device| definition_matches_device(&definition, device))
+        {
+            continue;
+        }
+
+        let center = match definition.control_device_id.as_deref() {
+            Some(id) => state.resolve_device(id).await,
+            None => None,
+        };
+        let device_state = state.effective_virtual_control_state(&definition).await;
+        let cloud_online = center.as_ref().and_then(Device::cloud_online);
+        let room = center.as_ref().and_then(Device::room_name);
+        let id = definition.stable_id();
+        result.push(DeviceItem {
+            sku: "MusicDreamView".to_string(),
+            safe_id: topic_safe_string(&id),
+            id,
+            name: definition.name,
+            room,
+            ip: None,
+            state: device_state,
+            mqtt_configured,
+            api_metadata: true,
+            lan_discovered: false,
+            // The row remains available when its state is not observable; the
+            // selected center and Platform capability are enough to control it.
+            available: center
+                .as_ref()
+                .map(|device| {
+                    device.get_capability_by_instance("dreamViewToggle").is_some()
+                        && device.cloud_online() != Some(false)
+                })
+                .unwrap_or(false),
+            cloud_supported: true,
+            cloud_status_observable: true,
+            cloud_online,
+            is_virtual: true,
+            virtual_kind: Some(VirtualDeviceKind::MusicDreamView),
+            virtual_member_count: Some(definition.member_ids.len()),
+            supports_brightness: false,
+            supports_rgb: false,
+            supports_dreamview: false,
+            dreamview_enabled: None,
+            supports_music_mode: false,
+            active_music_mode: None,
         });
     }
 
@@ -292,6 +354,38 @@ async fn device_power_off(
         .await
         .map_err(generic)?;
 
+    Ok(response_with_code(StatusCode::OK, "ok"))
+}
+
+async fn virtual_control_power_on(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let definition = state
+        .virtual_control_by_id(&id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Unknown virtual control {id}"))
+        .map_err(not_found)?;
+    state
+        .virtual_control_set_power(&definition, true)
+        .await
+        .map_err(generic)?;
+    Ok(response_with_code(StatusCode::OK, "ok"))
+}
+
+async fn virtual_control_power_off(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let definition = state
+        .virtual_control_by_id(&id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Unknown virtual control {id}"))
+        .map_err(not_found)?;
+    state
+        .virtual_control_set_power(&definition, false)
+        .await
+        .map_err(generic)?;
     Ok(response_with_code(StatusCode::OK, "ok"))
 }
 
@@ -792,6 +886,14 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
         .route("/api/device/{id}/power/on", post(device_power_on))
         .route("/api/device/{id}/power/off", post(device_power_off))
         .route(
+            "/api/virtual-control/{id}/power/on",
+            post(virtual_control_power_on),
+        )
+        .route(
+            "/api/virtual-control/{id}/power/off",
+            post(virtual_control_power_off),
+        )
+        .route(
             "/api/device/{id}/dreamview/on",
             post(device_dreamview_on),
         )
@@ -1120,6 +1222,11 @@ mod tests {
             });
             device.set_cloud_online(false);
         }
+        state
+            .set_video_dreamview_centers(
+                ["aa:bb".to_string()].into_iter().collect(),
+            )
+            .await;
 
         let app = build_router(state, false);
         let response = app
@@ -1140,6 +1247,89 @@ mod tests {
         assert_eq!(item["cloud_online"], false);
         assert_eq!(item["available"], false);
         assert_eq!(item["supports_dreamview"], true);
+    }
+
+    #[tokio::test]
+    async fn devices_endpoint_separates_music_and_video_dreamview() {
+        let state = StateHandle::default();
+        {
+            let mut center = state.device_mut("H606A", "CENTER").await;
+            center.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "H606A".to_string(),
+                device: "CENTER".to_string(),
+                device_name: "Music center".to_string(),
+                device_type: crate::platform_api::DeviceType::Light,
+                capabilities: vec![crate::platform_api::DeviceCapability {
+                    kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+                    instance: "dreamViewToggle".to_string(),
+                    parameters: None,
+                    alarm_type: None,
+                    event_state: None,
+                }],
+            });
+            center.set_http_device_state(crate::platform_api::HttpDeviceState {
+                sku: "H606A".to_string(),
+                device: "CENTER".to_string(),
+                capabilities: vec![
+                    crate::platform_api::DeviceCapabilityState {
+                        kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+                        instance: "powerSwitch".to_string(),
+                        state: serde_json::json!({"value": 1}),
+                    },
+                    crate::platform_api::DeviceCapabilityState {
+                        kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+                        instance: "dreamViewToggle".to_string(),
+                        state: serde_json::json!({"value": 0}),
+                    },
+                ],
+            });
+        }
+        state
+            .device_mut("H6000", "MEMBER")
+            .await
+            .set_lan_device_status(crate::lan_api::DeviceStatus {
+                on: true,
+                brightness: 75,
+                color: crate::lan_api::DeviceColor { r: 1, g: 2, b: 3 },
+                color_temperature_kelvin: 4000,
+                mode: None,
+            });
+        state
+            .set_virtual_controls(vec![
+                crate::service::virtual_controls::VirtualControlDefinition {
+                    kind: VirtualDeviceKind::MusicDreamView,
+                    ids: vec!["1447".to_string()],
+                    name: "MusicLight-1".to_string(),
+                    member_ids: vec!["CENTER".to_string(), "MEMBER".to_string()],
+                    control_device_id: Some("CENTER".to_string()),
+                },
+            ])
+            .await;
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = json.as_array().unwrap();
+        let center = items.iter().find(|item| item["id"] == "CENTER").unwrap();
+        let music = items
+            .iter()
+            .find(|item| item["name"] == "MusicLight-1")
+            .unwrap();
+
+        assert_eq!(center["supports_dreamview"], false);
+        assert_eq!(music["virtual_kind"], "music_dream_view");
+        assert_eq!(music["virtual_member_count"], 2);
+        assert_eq!(music["state"]["on"], false);
+        assert_eq!(music["state"]["source"], "PLATFORM MODE");
     }
 
     #[tokio::test]
@@ -1302,6 +1492,7 @@ mod tests {
                     ids: vec!["group-1".to_string()],
                     name: "All lights".to_string(),
                     member_ids: vec!["lamp-one".to_string(), "lamp-two".to_string()],
+                    control_device_id: None,
                 },
             ])
             .await;

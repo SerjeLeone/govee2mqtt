@@ -208,6 +208,11 @@ async fn refresh_virtual_control_topology(
     match topology {
         Ok(components) => {
             state
+                .set_video_dreamview_centers(
+                    crate::service::virtual_controls::parse_video_dreamview_centers(&components),
+                )
+                .await;
+            state
                 .set_virtual_controls(
                     crate::service::virtual_controls::parse_virtual_controls(&components),
                 )

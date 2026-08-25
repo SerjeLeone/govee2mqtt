@@ -215,6 +215,7 @@ pub async fn enumerate_entities_for_device<'a>(
 
     let mut has_dedicated_scene_controls = false;
     let mut has_dreamview_switch = false;
+    let supports_video_dreamview = state.device_supports_dreamview(d).await;
 
     if let Some(info) = &d.http_device_info {
         for (instance, label) in [
@@ -238,6 +239,11 @@ pub async fn enumerate_entities_for_device<'a>(
 
         for cap in &info.capabilities {
             if cap.instance == "dreamViewToggle" {
+                if !supports_video_dreamview {
+                    // Music DreamView centers advertise the same generic
+                    // capability but are exposed as saved group/scene cards.
+                    continue;
+                }
                 has_dreamview_switch = true;
             }
             match &cap.kind {
@@ -283,7 +289,7 @@ pub async fn enumerate_entities_for_device<'a>(
 
     }
 
-    if d.supports_dreamview() && !has_dreamview_switch {
+    if supports_video_dreamview && !has_dreamview_switch {
         let capability = DeviceCapability {
             kind: DeviceCapabilityKind::Toggle,
             instance: "dreamViewToggle".to_string(),

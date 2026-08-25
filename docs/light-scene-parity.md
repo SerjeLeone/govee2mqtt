@@ -60,7 +60,7 @@ You can also expand a device in the Web UI (click the row) to see capability cou
 - LAN fallback covers known scene-code based scenes for both the legacy `Mode/Scene` select and the dedicated `Scene` select, but not arbitrary captured DIY app payloads (use the ptReal endpoint for those).
 - Some devices may expose scene options only through capability shapes we do not currently parse.
 - "Sub-scenes" (e.g., "Cha-Cha-B" vs "Cha-Cha-A") are not always exposed — the Platform API may only return the parent scene name.
-- Hardware DreamView devices that expose `dreamViewToggle` are supported through LAN-first `ptReal` control. Camera-based video sync and the separate `movieMode` capability remain unsupported; use Tap-to-Run snapshots where applicable.
+- Video DreamView is exposed only on the sync centers selected by the Govee home-layout API and uses LAN-first `ptReal` control. Saved Music DreamView cards are exposed separately as API-backed group/scene controls. The separate `movieMode` capability remains unsupported; use Tap-to-Run snapshots where applicable.
 - Game scenes (reported in issue #529) are not exposed through any known API.
 
 ## Code Hotspots

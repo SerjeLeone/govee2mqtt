@@ -31,8 +31,8 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 * Device grouping — control multiple devices as one light entity.
 * Per-device configuration overrides via JSON file (names, color temp, icons, rooms).
 * Web UI with physical-device controls, separate group/DreamView-scene controls,
-  dedicated hardware DreamView and music-mode controls, live logs, and bridge
-  status.
+  API-backed Music DreamView cards, dedicated DreamView controls for the
+  selected video sync centers, live logs, and bridge status.
 * Native Home Assistant fan entities, air-quality sensors, and diagnostic
   battery/Wi-Fi sensors for supported devices.
 * Bounded LAN retries and a per-device polling circuit breaker for congested or
@@ -49,7 +49,8 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 |Tap-to-Run / One Click Scene|IoT|Find in the overall list of Scenes in Home Assistant, as well as under the `Govee to MQTT` device|
 |Live Device Status Updates|LAN and/or IoT and/or API Key|Devices typically report most changes within a couple of seconds.|
 |Segment Color|LAN; optional cloud fallback|Find the `Segment 00X` light entities associated with your main light device in Home Assistant. LAN is always attempted first.|
-|DreamView|LAN; optional cloud fallback|Hardware `dreamViewToggle` devices are controlled with LAN `ptReal` first. Camera-only video sync is not exposed.|
+|Video DreamView|Govee account topology + LAN; optional cloud fallback|Only user-selected video sync centers are exposed. Their `dreamViewToggle` is controlled with LAN `ptReal` first.|
+|Music DreamView scenes|Govee account topology + API Key|Saved Music DreamView cards appear under Groups & scenes with API-derived members and use their selected music center's Platform capability.|
 |Energy Monitoring|API Key|Smart plugs expose power, voltage, current, and energy sensors|
 |Effect List Filtering|API Key|Disable or filter effects for Google Home compatibility|
 |Device Groups|Config file|Control multiple devices as a single HA light entity|
@@ -69,9 +70,10 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 | Govee Push | API key | Read-only | Real-time push | Low |
 
 The bridge picks the best available channel for each device and command. For
-segments and DreamView, this policy is deliberately stricter: LAN is first and
-the cloud is used only when `lan_cloud_fallback` explicitly names `iot` or
-`platform`.
+segments and a selected video DreamView center, this policy is deliberately
+stricter: LAN is first and the cloud is used only when `lan_cloud_fallback`
+explicitly names `iot` or `platform`. Saved Music DreamView cards use the
+Platform capability advertised by their API-selected music center.
 
 * `API Key` means that you have [applied for a key from Govee](https://developer.govee.com/reference/apply-you-govee-api-key)
   and have configured it for use in govee2mqtt

@@ -59,6 +59,7 @@ pub struct State {
     temperature_scale: Mutex<TemperatureScale>,
     lan_cloud_fallback: Mutex<CloudFallbackTransport>,
     virtual_controls: Mutex<Vec<VirtualControlDefinition>>,
+    video_dreamview_centers: Mutex<HashSet<String>>,
     pub event_bus: crate::service::event_bus::EventBus,
     /// Govee official MQTT push stats
     pub push_connected: std::sync::atomic::AtomicBool,
@@ -79,6 +80,7 @@ impl Default for State {
             temperature_scale: Default::default(),
             lan_cloud_fallback: Default::default(),
             virtual_controls: Default::default(),
+            video_dreamview_centers: Default::default(),
             event_bus: crate::service::event_bus::EventBus::new(),
             push_connected: std::sync::atomic::AtomicBool::new(false),
             push_event_count: std::sync::atomic::AtomicU64::new(0),
@@ -162,6 +164,46 @@ impl State {
         *self.virtual_controls.lock().await = controls;
     }
 
+    pub async fn set_video_dreamview_centers(&self, centers: HashSet<String>) {
+        log::info!(
+            "Loaded {} selected video DreamView sync center(s)",
+            centers.len()
+        );
+        *self.video_dreamview_centers.lock().await = centers;
+    }
+
+    pub async fn virtual_controls(&self) -> Vec<VirtualControlDefinition> {
+        self.virtual_controls.lock().await.clone()
+    }
+
+    pub async fn device_supports_dreamview(&self, device: &Device) -> bool {
+        device.supports_dreamview()
+            && self
+                .video_dreamview_centers
+                .lock()
+                .await
+                .contains(&device.id.to_ascii_lowercase())
+    }
+
+    pub async fn virtual_control_by_id(
+        &self,
+        id: &str,
+    ) -> Option<VirtualControlDefinition> {
+        self.virtual_controls
+            .lock()
+            .await
+            .iter()
+            .find(|definition| {
+                topic_safe_string(&definition.stable_id()).eq_ignore_ascii_case(id)
+                    || definition.name.eq_ignore_ascii_case(id)
+                    || definition
+                        .ids
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(id))
+            })
+            .cloned()
+    }
+
     pub async fn virtual_control_for_device(
         &self,
         device: &Device,
@@ -196,6 +238,7 @@ impl State {
                         ids: vec![id],
                         name: group.name,
                         member_ids: group.members,
+                        control_device_id: None,
                     });
                     break;
                 }
@@ -233,6 +276,29 @@ impl State {
         };
         let devices = self.devices_by_id.lock().await;
         aggregate_virtual_state(&definition, &devices).or_else(|| device.device_state())
+    }
+
+    pub async fn effective_virtual_control_state(
+        &self,
+        definition: &VirtualControlDefinition,
+    ) -> Option<crate::service::device::DeviceState> {
+        let devices = self.devices_by_id.lock().await;
+        let aggregate = aggregate_virtual_state(definition, &devices);
+        if definition.kind != VirtualDeviceKind::MusicDreamView {
+            return aggregate;
+        }
+
+        let center_id = definition.control_device_id.as_ref()?;
+        let center = devices.values().find(|device| {
+            device.id.eq_ignore_ascii_case(center_id)
+                || topic_safe_id(device).eq_ignore_ascii_case(center_id)
+        })?;
+        let enabled = center.dreamview_enabled()?;
+        let mut state = aggregate.or_else(|| center.device_state())?;
+        state.on = enabled;
+        state.light_on = Some(enabled);
+        state.source = "PLATFORM MODE";
+        Some(state)
     }
 
     pub async fn virtual_devices_for_member(&self, member_id: &str) -> Vec<Device> {
@@ -862,6 +928,11 @@ impl State {
         device: &Device,
         enabled: bool,
     ) -> anyhow::Result<()> {
+        if !self.device_supports_dreamview(device).await {
+            anyhow::bail!(
+                "Unable to set video DreamView for {device}: it is not a selected video sync center"
+            );
+        }
         let fallback = self.get_lan_cloud_fallback().await;
         let order = feature_transport_order(device.lan_device.is_some(), fallback);
         if order.is_empty() {
@@ -921,6 +992,46 @@ impl State {
             "Unable to set DreamView for {device}{fallback_hint}: {}",
             failures.join("; ")
         )
+    }
+
+    /// Toggle a saved Music DreamView scene through its API-advertised sync
+    /// center. This deliberately uses the Platform capability directly: the
+    /// same `dreamViewToggle` instance means video DreamView on video centers,
+    /// but Music DreamView on music centers, so the generic LAN packet must not
+    /// be sent to the latter.
+    pub async fn virtual_control_set_power(
+        self: &Arc<Self>,
+        definition: &VirtualControlDefinition,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        if definition.kind != VirtualDeviceKind::MusicDreamView {
+            anyhow::bail!("{} is not an API-backed Music DreamView scene", definition.name);
+        }
+        let center_id = definition.control_device_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Music DreamView scene {} has no sync center", definition.name)
+        })?;
+        let center = self.resolve_device(center_id).await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Music DreamView sync center {center_id} for {} was not discovered",
+                definition.name
+            )
+        })?;
+        if center.get_capability_by_instance("dreamViewToggle").is_none() {
+            anyhow::bail!(
+                "Music DreamView sync center {center} does not advertise dreamViewToggle"
+            );
+        }
+
+        log::info!(
+            "Using Platform API to set Music DreamView scene {} through {center}",
+            definition.name
+        );
+        self.send_platform_dreamview_command(&center, enabled).await?;
+        self.device_mut(&center.sku, &center.id)
+            .await
+            .set_dreamview_enabled(enabled);
+        self.notify_of_state_change(&center.id).await?;
+        Ok(())
     }
 
     pub async fn device_control<V: Into<JsonValue>>(

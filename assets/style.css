@@ -120,6 +120,16 @@
   margin-top: 0.1rem;
 }
 
+/* Bootstrap paints an indeterminate switch blue, which makes an unknown or
+ * not-yet-polled state look enabled. Keep the semantic indeterminate state for
+ * accessibility while rendering the switch with the neutral OFF appearance. */
+.form-switch .form-check-input:indeterminate {
+  background-color: var(--bs-tertiary-bg);
+  border-color: var(--bs-border-color);
+  background-image: var(--bs-form-switch-bg);
+  background-position: left center;
+}
+
 @media (max-width: 575.98px) {
   .device-availability-filter {
     flex-basis: 100%;

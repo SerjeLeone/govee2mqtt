@@ -108,12 +108,18 @@ observed it.
 
 ### LAN-first feature fallback
 
-Segment color/off and hardware DreamView (`dreamViewToggle`) commands use LAN
-`ptReal` first. A `ptReal` UDP write has no acknowledgement, so the bridge runs
-one status-query cycle using `lan_query_attempts` and `lan_query_backoff_ms` as a
-liveness check. It uses the configured cloud fallback only if those LAN probes
-fail or the device was not discovered on LAN. Cloud credentials alone never
-enable this fallback.
+Segment color/off commands and video DreamView (`dreamViewToggle`) commands for
+sync centers selected in the Govee home-layout topology use LAN `ptReal` first.
+A `ptReal` UDP write has no acknowledgement, so the bridge runs one status-query
+cycle using `lan_query_attempts` and `lan_query_backoff_ms` as a liveness check.
+It uses the configured cloud fallback only if those LAN probes fail or the
+device was not discovered on LAN. Cloud credentials alone never enable this
+fallback, and a generic `dreamViewToggle` capability does not make a light a
+video sync center.
+
+Saved Music DreamView cards are a separate API-backed virtual control. They are
+listed under **Groups & scenes**, take their members and selected music center
+from the home-layout API, and call that center's Platform capability directly.
 
 The `iot` fallback is attempted only when account login has produced an IoT
 client and the device metadata contains a usable IoT topic. This explicit

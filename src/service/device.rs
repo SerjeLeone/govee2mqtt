@@ -965,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_models_expose_dreamview_without_cloud_metadata() {
+    fn verified_models_report_dreamview_hardware_support_without_cloud_metadata() {
         for sku in ["H66A1", "H6199"] {
             let device = Device::new(sku, "aa:bb");
             assert!(device.supports_dreamview(), "{sku}");

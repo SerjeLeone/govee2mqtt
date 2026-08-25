@@ -77,7 +77,10 @@ export class DeviceList extends LitElement {
     const id = encodeURIComponent(e.target.dataset.id);
     const name = e.target.dataset.name || id;
     const power = e.target.checked ? 'on' : 'off';
-    this._apiAction(`api/device/${id}/power/${power}`, `${name} ${power}`);
+    const path = e.target.dataset.virtualControl === 'true'
+      ? 'api/virtual-control'
+      : 'api/device';
+    this._apiAction(`${path}/${id}/power/${power}`, `${name} ${power}`);
   }
 
   _set_dreamview(e) {
@@ -158,6 +161,7 @@ export class DeviceList extends LitElement {
   }
 
   async _toggleDetail(e) {
+    if (e.currentTarget.dataset.virtualControl === 'true') return;
     const id = e.currentTarget.dataset.id;
     if (this.expandedDevice === id) {
       this.expandedDevice = null;
@@ -200,7 +204,11 @@ export class DeviceList extends LitElement {
                     <dt class="col-4">Model</dt><dd class="col-8">${data.sku || item.sku}</dd>
                     ${item.is_virtual ? html`
                       <dt class="col-4">Type</dt><dd class="col-8">
-                        ${item.virtual_kind === 'dream_view_scene' ? 'DreamView scene' : 'Group control'}
+                        ${item.virtual_kind === 'dream_view_scene'
+                          ? 'DreamView scene'
+                          : item.virtual_kind === 'music_dream_view'
+                            ? 'Music DreamView'
+                            : 'Group control'}
                       </dd>
                       <dt class="col-4">Members</dt><dd class="col-8">
                         ${item.virtual_member_count ?? 'Unknown'}
@@ -343,7 +351,9 @@ export class DeviceList extends LitElement {
 
     const rows = [html`
       <tr class="gv-device-row ${isExpanded ? 'table-active' : ''}"
-          data-id=${item.safe_id} @click=${this._toggleDetail}>
+          data-id=${item.safe_id}
+          data-virtual-control=${item.virtual_kind === 'music_dream_view' ? 'true' : 'false'}
+          @click=${this._toggleDetail}>
         <td>
           <span class="gv-status-dot ${item.available ? 'online' : 'offline'}"></span>
           <strong>${item.name}</strong>
@@ -352,7 +362,11 @@ export class DeviceList extends LitElement {
             ${item.is_virtual
               ? html`
                   <span class="badge rounded-pill text-bg-info">
-                    ${item.virtual_kind === 'dream_view_scene' ? 'DreamView scene' : 'Group'}
+                    ${item.virtual_kind === 'dream_view_scene'
+                      ? 'DreamView scene'
+                      : item.virtual_kind === 'music_dream_view'
+                        ? 'Music DreamView'
+                        : 'Group'}
                   </span>
                   <span class="badge rounded-pill text-bg-secondary">Platform control</span>
                   ${item.virtual_member_count != null
@@ -372,6 +386,7 @@ export class DeviceList extends LitElement {
           <div class="d-flex align-items-center gap-2 flex-wrap">
             <span class="form-switch mb-0">
               <input data-id=${item.safe_id} data-name=${item.name}
+                data-virtual-control=${item.virtual_kind === 'music_dream_view' ? 'true' : 'false'}
                 class="form-check-input" type="checkbox" role="switch"
                 @click=${this._set_power_on} ?checked=${isOn}
                 .indeterminate=${!hasState}

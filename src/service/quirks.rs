@@ -40,8 +40,9 @@ pub struct Quirk {
     pub show_as_preset_buttons: Option<&'static [&'static str]>,
     /// Number of controllable segments, if the Platform API doesn't report them.
     pub segment_count: Option<u32>,
-    /// Expose the local DreamView switch even when cloud capability metadata
-    /// is unavailable during an offline startup.
+    /// Recognize verified DreamView hardware when cloud capability metadata is
+    /// unavailable. Exposure is still gated by the selected video-center
+    /// topology.
     pub supports_dreamview: bool,
 }
 
