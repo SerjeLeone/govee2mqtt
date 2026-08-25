@@ -19,8 +19,10 @@ impl VirtualDeviceKind {
     pub fn from_sku(sku: &str) -> Option<Self> {
         match sku {
             "BaseGroup" => Some(Self::BaseGroup),
-            "DreamViewScenic" => Some(Self::DreamViewScene),
-            "MusicDreamView" => Some(Self::MusicDreamView),
+            // Scenic DreamView is operationally a DreamView mode: its real
+            // state/control lives on the selected physical sync center's
+            // dreamViewToggle capability, not on the virtual powerSwitch.
+            "DreamViewScenic" | "MusicDreamView" => Some(Self::MusicDreamView),
             _ => None,
         }
     }
@@ -80,30 +82,52 @@ fn has_saved_control_id(value: &JsonValue) -> bool {
 }
 
 fn device_id(device: &JsonValue) -> Option<String> {
-    let value = device.get("device").unwrap_or(device);
+    let value = device
+        .get("device")
+        .or_else(|| device.get("deviceId"))
+        .unwrap_or(device);
     json_identifier(Some(value))
 }
 
-/// Govee has moved the member list between `devices` and nested configuration
-/// objects across app/API generations. Collect every object field literally
-/// named `device`; unrelated identifiers such as `deviceType` are ignored.
+fn is_device_collection_field(name: &str) -> bool {
+    matches!(
+        name,
+        "devices" | "subDevices" | "members" | "memberDevices" | "deviceList"
+    )
+}
+
+/// Govee has moved membership between `devices`, `subDevices`, nested config
+/// objects and direct arrays across app/API generations. Collect explicit
+/// `device`/`deviceId` values everywhere and scalar IDs only when they are
+/// directly inside a field that is known to be a device collection.
 fn append_nested_device_ids(member_ids: &mut Vec<String>, value: &JsonValue) {
-    match value {
-        JsonValue::Object(object) => {
-            if let Some(id) = json_identifier(object.get("device")) {
-                push_unique_case_insensitive(member_ids, id);
+    fn walk(member_ids: &mut Vec<String>, value: &JsonValue, scalar_is_device: bool) {
+        match value {
+            JsonValue::Object(object) => {
+                if let Some(id) = json_identifier(object.get("device"))
+                    .or_else(|| json_identifier(object.get("deviceId")))
+                {
+                    push_unique_case_insensitive(member_ids, id);
+                }
+                for (name, child) in object {
+                    walk(member_ids, child, is_device_collection_field(name));
+                }
             }
-            for child in object.values() {
-                append_nested_device_ids(member_ids, child);
+            JsonValue::Array(values) => {
+                for child in values {
+                    walk(member_ids, child, scalar_is_device);
+                }
             }
+            JsonValue::String(_) | JsonValue::Number(_) if scalar_is_device => {
+                if let Some(id) = json_identifier(Some(value)) {
+                    push_unique_case_insensitive(member_ids, id);
+                }
+            }
+            _ => {}
         }
-        JsonValue::Array(values) => {
-            for child in values {
-                append_nested_device_ids(member_ids, child);
-            }
-        }
-        _ => {}
     }
+
+    walk(member_ids, value, false);
 }
 
 fn definition_from_json(
@@ -134,11 +158,16 @@ fn definition_from_json(
     }
 
     let entry_main_device = object.get("feastMainDevice").and_then(device_id);
-    let component_main_device = component_main_device.and_then(device_id);
-    let control_device_id = entry_main_device.or(component_main_device);
+    let component_main_device_id = component_main_device.and_then(device_id);
+    let control_device_id = entry_main_device.or(component_main_device_id);
 
     let mut member_ids = vec![];
     append_nested_device_ids(&mut member_ids, value);
+    if let Some(main_device) = component_main_device {
+        // Some Govee Home versions keep the full Scenic/Music topology under
+        // mainDevice.subDevices rather than in the feast entry itself.
+        append_nested_device_ids(&mut member_ids, main_device);
+    }
     if let Some(main) = control_device_id.as_ref() {
         push_unique_case_insensitive(&mut member_ids, main.clone());
     }
@@ -154,11 +183,71 @@ fn definition_from_json(
     )
 }
 
-/// Extract BaseGroup, ScenicView and Music DreamView membership from the
-/// undocumented home-layout response. Govee uses `feastType` 1 for Music
-/// DreamView, 2 for ScenicView and 3 for video DreamView. Video DreamView is
-/// represented by a switch on its selected physical sync center rather than a
-/// second virtual object.
+fn entry_feast_type(entry: &JsonValue, fallback: Option<u64>) -> Option<u64> {
+    entry
+        .get("feastType")
+        .and_then(JsonValue::as_u64)
+        .or(fallback)
+}
+
+fn is_generic_music_placeholder(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "music dreamview" | "music dream view" | "music"
+    )
+}
+
+/// Build one account-level video DreamView mode. Govee may repeat
+/// `feastMainDevice` inside member/environment entries; those objects are
+/// members/configuration, not additional selected video sync centers.
+fn video_dreamview_definition(
+    component: &OneClickComponent,
+    entries: &[&JsonValue],
+) -> Option<VirtualControlDefinition> {
+    let control_device_id = component
+        .main_device
+        .as_ref()
+        .and_then(device_id)
+        .or_else(|| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .get("feastMainDevice")
+                    .and_then(device_id)
+            })
+        })?;
+
+    let mut member_ids = vec![];
+    if let Some(main) = component.main_device.as_ref() {
+        append_nested_device_ids(&mut member_ids, main);
+    }
+    for entry in entries {
+        append_nested_device_ids(&mut member_ids, entry);
+    }
+    push_unique_case_insensitive(&mut member_ids, control_device_id.clone());
+
+    let mut ids = vec![];
+    if component.component_id > 0 {
+        ids.push(component.component_id.to_string());
+    }
+
+    Some(VirtualControlDefinition {
+        // Existing API/UI plumbing already treats MusicDreamView as a
+        // sync-center-backed mode rather than a pollable virtual power object.
+        // Video and Scenic DreamView intentionally use that same operational
+        // kind so they share cloud state/control without physical switches.
+        kind: VirtualDeviceKind::MusicDreamView,
+        ids,
+        name: "DreamView".to_string(),
+        member_ids,
+        control_device_id: Some(control_device_id),
+    })
+}
+
+/// Extract BaseGroup and all DreamView modes from the undocumented home-layout
+/// response. Govee uses `feastType` 1 for Music DreamView, 2 for ScenicView and
+/// 3 for video DreamView. All DreamView modes are controlled through the
+/// selected physical sync center's `dreamViewToggle`; the physical device is
+/// therefore not itself exposed as a DreamView switch.
 pub fn parse_virtual_controls(
     components: &[OneClickComponent],
 ) -> Vec<VirtualControlDefinition> {
@@ -177,39 +266,58 @@ pub fn parse_virtual_controls(
             }
         }
 
+        if component.component_type != 2 {
+            continue;
+        }
+
         let dreamview_entries: Vec<_> = component
             .feasts
             .iter()
             .chain(component.environments.iter())
             .collect();
-        if component.component_type == 2 {
-            let kind = match component.feast_type {
-                Some(1) => Some(VirtualDeviceKind::MusicDreamView),
-                Some(2) => Some(VirtualDeviceKind::DreamViewScene),
-                // `3` is video DreamView and is exposed on the selected sync
-                // center. Unknown subtypes must not be mislabeled as scenes.
-                _ => None,
-            };
-            let Some(kind) = kind else {
+
+        let has_video_dreamview = component.feast_type == Some(3)
+            || dreamview_entries
+                .iter()
+                .any(|entry| entry_feast_type(entry, None) == Some(3));
+        if has_video_dreamview {
+            let video_entries: Vec<_> = dreamview_entries
+                .iter()
+                .copied()
+                .filter(|entry| entry_feast_type(entry, component.feast_type) == Some(3))
+                .collect();
+            if let Some(definition) = video_dreamview_definition(component, &video_entries) {
+                definitions.push(definition);
+            }
+        }
+
+        for entry in &dreamview_entries {
+            let feast_type = entry_feast_type(entry, component.feast_type);
+            // Video DreamView is represented by the single account-level
+            // definition above; do not turn each environment into a center.
+            if feast_type == Some(3) {
                 continue;
-            };
-            for entry in &dreamview_entries {
-                if let Some(definition) = definition_from_json(
-                    entry,
-                    kind,
-                    Some(component.component_id),
-                    component.main_device.as_ref(),
-                    dreamview_entries.len() == 1,
-                ) {
-                    // Empty/default Music DreamView placeholders have no
-                    // positive saved ID and contain only the center. A valid
-                    // one-device saved card must still be exposed.
-                    let empty_music_placeholder = kind == VirtualDeviceKind::MusicDreamView
-                        && !has_saved_control_id(entry)
-                        && definition.member_ids.len() <= 1;
-                    if !empty_music_placeholder {
-                        definitions.push(definition);
-                    }
+            }
+            if !matches!(feast_type, Some(1) | Some(2)) {
+                continue;
+            }
+
+            if let Some(definition) = definition_from_json(
+                entry,
+                VirtualDeviceKind::MusicDreamView,
+                Some(component.component_id),
+                component.main_device.as_ref(),
+                dreamview_entries.len() == 1,
+            ) {
+                // Only suppress the unnamed/default Music DreamView placeholder.
+                // User-saved cards such as MusicLight-1/2 are valid even when
+                // this API generation returns feastId=-1 and only the center.
+                let empty_music_placeholder = feast_type == Some(1)
+                    && !has_saved_control_id(entry)
+                    && definition.member_ids.len() <= 1
+                    && is_generic_music_placeholder(&definition.name);
+                if !empty_music_placeholder {
+                    definitions.push(definition);
                 }
             }
         }
@@ -218,26 +326,41 @@ pub fn parse_virtual_controls(
     definitions
 }
 
-/// IDs of the user-selected video DreamView sync centers. A generic
-/// `dreamViewToggle` capability is also advertised on Music DreamView centers,
-/// so capability metadata alone is not sufficient to expose the video switch.
+/// IDs of the actual user-selected video DreamView sync centers. Use only the
+/// component's main device (or one fallback when it is absent); repeated
+/// feast/environment `feastMainDevice` objects must never create extra centers.
 pub fn parse_video_dreamview_centers(components: &[OneClickComponent]) -> HashSet<String> {
     let mut centers = HashSet::new();
     for component in components {
-        if component.component_type != 2 || component.feast_type != Some(3) {
+        if component.component_type != 2 {
             continue;
         }
-        if let Some(main) = component.main_device.as_ref().and_then(device_id) {
-            centers.insert(main.to_ascii_lowercase());
-        }
-        for entry in component
+        let entries: Vec<_> = component
             .feasts
             .iter()
             .chain(component.environments.iter())
-        {
-            if let Some(main) = entry.get("feastMainDevice").and_then(device_id) {
-                centers.insert(main.to_ascii_lowercase());
-            }
+            .collect();
+        let is_video = component.feast_type == Some(3)
+            || entries
+                .iter()
+                .any(|entry| entry_feast_type(entry, None) == Some(3));
+        if !is_video {
+            continue;
+        }
+
+        let center = component
+            .main_device
+            .as_ref()
+            .and_then(device_id)
+            .or_else(|| {
+                entries.iter().find_map(|entry| {
+                    (entry_feast_type(entry, component.feast_type) == Some(3))
+                        .then(|| entry.get("feastMainDevice").and_then(device_id))
+                        .flatten()
+                })
+            });
+        if let Some(center) = center {
+            centers.insert(center.to_ascii_lowercase());
         }
     }
     centers
@@ -264,14 +387,23 @@ fn find_device<'a>(devices: &'a HashMap<String, Device>, id: &str) -> Option<&'a
     })
 }
 
-/// Aggregate a virtual control from its physical members. The control is ON
-/// only when every member has a known ON state. A known OFF member is enough
-/// to report OFF; otherwise incomplete membership/state remains unknown rather
-/// than being rendered as a false OFF value.
+/// State for account-level DreamView modes comes from the selected sync
+/// center's cloud `dreamViewToggle`. Base groups still aggregate member power.
 pub fn aggregate_virtual_state(
     definition: &VirtualControlDefinition,
     devices: &HashMap<String, Device>,
 ) -> Option<DeviceState> {
+    if definition.kind == VirtualDeviceKind::MusicDreamView {
+        let center_id = definition.control_device_id.as_ref()?;
+        let center = find_device(devices, center_id)?;
+        let enabled = center.dreamview_enabled()?;
+        let mut state = center.device_state()?;
+        state.on = enabled;
+        state.light_on = Some(enabled);
+        state.source = "PLATFORM MODE";
+        return Some(state);
+    }
+
     if definition.member_ids.is_empty() {
         return None;
     }
@@ -358,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_base_group_and_dreamview_members_without_names_hardcoded() {
+    fn parses_base_group_and_scenic_members_without_names_hardcoded() {
         let response: crate::undoc_api::OneClickResponse =
             crate::platform_api::from_json(include_str!("../../test-data/undoc-one-click.json"))
                 .unwrap();
@@ -371,12 +503,13 @@ mod tests {
         assert!(group.ids.iter().any(|id| id == "1234"));
         assert_eq!(group.member_ids, vec![":35:29"]);
 
-        let dreamview = definitions
+        let scenic = definitions
             .iter()
-            .find(|definition| definition.kind == VirtualDeviceKind::DreamViewScene)
+            .find(|definition| definition.name == "Scenic DreamView")
             .unwrap();
-        assert_eq!(dreamview.name, "Scenic DreamView");
-        assert!(dreamview.member_ids.iter().any(|id| id == ":11"));
+        assert_eq!(scenic.kind, VirtualDeviceKind::MusicDreamView);
+        assert!(scenic.member_ids.iter().any(|id| id == ":11"));
+        assert_eq!(scenic.control_device_id.as_deref(), Some(":11"));
     }
 
     #[test]
@@ -400,7 +533,7 @@ mod tests {
     #[test]
     fn incomplete_all_on_group_remains_unknown() {
         let definition = VirtualControlDefinition {
-            kind: VirtualDeviceKind::DreamViewScene,
+            kind: VirtualDeviceKind::BaseGroup,
             ids: vec![],
             name: "Scene".into(),
             member_ids: vec!["one".into(), "missing".into()],
@@ -409,6 +542,26 @@ mod tests {
         let mut devices = HashMap::new();
         devices.insert("one".into(), device("one", true));
         assert!(aggregate_virtual_state(&definition, &devices).is_none());
+    }
+
+    #[test]
+    fn dreamview_mode_uses_center_cloud_toggle_not_member_power() {
+        let definition = VirtualControlDefinition {
+            kind: VirtualDeviceKind::MusicDreamView,
+            ids: vec!["42".into()],
+            name: "ScenicView".into(),
+            member_ids: vec!["CENTER".into(), "MEMBER".into()],
+            control_device_id: Some("CENTER".into()),
+        };
+        let mut center = device("CENTER", true);
+        center.set_dreamview_enabled(false);
+        let mut devices = HashMap::new();
+        devices.insert("CENTER".into(), center);
+        devices.insert("MEMBER".into(), device("MEMBER", true));
+
+        let state = aggregate_virtual_state(&definition, &devices).unwrap();
+        assert!(!state.on);
+        assert_eq!(state.source, "PLATFORM MODE");
     }
 
     fn dreamview_component(
@@ -462,19 +615,63 @@ mod tests {
     }
 
     #[test]
-    fn video_dreamview_selects_center_without_creating_virtual_scene() {
+    fn custom_music_dreamview_survives_negative_id_placeholder_shape() {
         let components = vec![dreamview_component(
-            3,
-            serde_json::json!({"device": "VIDEO-CENTER"}),
-            vec![],
+            1,
+            serde_json::json!({"device": "CENTER"}),
+            vec![serde_json::json!({
+                "feastId": -1,
+                "name": "MusicLight-2",
+                "devices": []
+            })],
         )];
 
-        assert!(parse_virtual_controls(&components).is_empty());
-        assert!(parse_video_dreamview_centers(&components).contains("video-center"));
+        let definitions = parse_virtual_controls(&components);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "MusicLight-2");
     }
 
     #[test]
-    fn empty_music_dreamview_placeholder_is_not_exposed() {
+    fn video_dreamview_is_one_virtual_mode_with_only_real_center_selected() {
+        let mut component = dreamview_component(
+            3,
+            serde_json::json!({
+                "device": "VIDEO-CENTER",
+                "subDevices": [
+                    {"device": "MEMBER-1"},
+                    {"device": "MEMBER-2"}
+                ]
+            }),
+            vec![serde_json::json!({
+                "feastType": 3,
+                "feastMainDevice": {"device": "NOT-A-CENTER"},
+                "devices": [{"device": "MEMBER-3"}]
+            })],
+        );
+        component.environments = vec![serde_json::json!({
+            "feastType": 3,
+            "feastMainDevice": {"device": "ALSO-NOT-A-CENTER"}
+        })];
+        let components = vec![component];
+
+        let definitions = parse_virtual_controls(&components);
+        let video = definitions
+            .iter()
+            .find(|definition| definition.name == "DreamView")
+            .unwrap();
+        assert_eq!(video.kind, VirtualDeviceKind::MusicDreamView);
+        assert_eq!(video.control_device_id.as_deref(), Some("VIDEO-CENTER"));
+        assert!(video.member_ids.iter().any(|id| id == "MEMBER-1"));
+        assert!(video.member_ids.iter().any(|id| id == "MEMBER-3"));
+
+        let centers = parse_video_dreamview_centers(&components);
+        assert_eq!(centers.len(), 1);
+        assert!(centers.contains("video-center"));
+        assert!(!centers.contains("not-a-center"));
+    }
+
+    #[test]
+    fn empty_generic_music_dreamview_placeholder_is_not_exposed() {
         let components = vec![dreamview_component(
             1,
             serde_json::json!({"device": "CENTER"}),

@@ -72,6 +72,28 @@ export class DeviceList extends LitElement {
     }
   }
 
+  _isDreamViewVirtualControl(item) {
+    return item.is_virtual && item.virtual_kind === 'music_dream_view';
+  }
+
+  _virtualControlLabel(item) {
+    if (item.sku === 'DreamViewScenic') return 'DreamView scene';
+    if (this._isDreamViewVirtualControl(item)) {
+      const name = (item.name || '').trim().toLowerCase();
+      if (name === 'dreamview' || name === 'video dreamview') return 'DreamView';
+      return 'Music DreamView';
+    }
+    return 'Group';
+  }
+
+  _virtualControlPriority(item) {
+    const label = this._virtualControlLabel(item);
+    if (label === 'DreamView') return 0;
+    if (label === 'DreamView scene') return 1;
+    if (label === 'Music DreamView') return 2;
+    return 3;
+  }
+
   _set_power_on(e) {
     e.stopPropagation();
     const id = encodeURIComponent(e.target.dataset.id);
@@ -81,17 +103,6 @@ export class DeviceList extends LitElement {
       ? 'api/virtual-control'
       : 'api/device';
     this._apiAction(`${path}/${id}/power/${power}`, `${name} ${power}`);
-  }
-
-  _set_dreamview(e) {
-    e.stopPropagation();
-    const id = encodeURIComponent(e.target.dataset.id);
-    const name = e.target.dataset.name || id;
-    const enabled = e.target.checked ? 'on' : 'off';
-    this._apiAction(
-      `api/device/${id}/dreamview/${enabled}`,
-      `${name} DreamView ${enabled}`,
-    );
   }
 
   _set_color(e) {
@@ -204,11 +215,7 @@ export class DeviceList extends LitElement {
                     <dt class="col-4">Model</dt><dd class="col-8">${data.sku || item.sku}</dd>
                     ${item.is_virtual ? html`
                       <dt class="col-4">Type</dt><dd class="col-8">
-                        ${item.virtual_kind === 'dream_view_scene'
-                          ? 'DreamView scene'
-                          : item.virtual_kind === 'music_dream_view'
-                            ? 'Music DreamView'
-                            : 'Group control'}
+                        ${this._virtualControlLabel(item)}
                       </dd>
                       <dt class="col-4">Members</dt><dd class="col-8">
                         ${item.virtual_member_count ?? 'Unknown'}
@@ -331,6 +338,7 @@ export class DeviceList extends LitElement {
     const rgb_hex = `#${color_value.toString(16).padStart(6, '0')}`;
     const updated = hasState ? timeAgo(new Date(item.state.updated)) : '';
     const source = item.state?.source || '';
+    const isDreamViewVirtual = this._isDreamViewVirtualControl(item);
 
     const scenes = item.is_virtual
       ? []
@@ -352,7 +360,7 @@ export class DeviceList extends LitElement {
     const rows = [html`
       <tr class="gv-device-row ${isExpanded ? 'table-active' : ''}"
           data-id=${item.safe_id}
-          data-virtual-control=${item.virtual_kind === 'music_dream_view' ? 'true' : 'false'}
+          data-virtual-control=${isDreamViewVirtual ? 'true' : 'false'}
           @click=${this._toggleDetail}>
         <td>
           <span class="gv-status-dot ${item.available ? 'online' : 'offline'}"></span>
@@ -362,11 +370,7 @@ export class DeviceList extends LitElement {
             ${item.is_virtual
               ? html`
                   <span class="badge rounded-pill text-bg-info">
-                    ${item.virtual_kind === 'dream_view_scene'
-                      ? 'DreamView scene'
-                      : item.virtual_kind === 'music_dream_view'
-                        ? 'Music DreamView'
-                        : 'Group'}
+                    ${this._virtualControlLabel(item)}
                   </span>
                   <span class="badge rounded-pill text-bg-secondary">Platform control</span>
                   ${item.virtual_member_count != null
@@ -386,7 +390,7 @@ export class DeviceList extends LitElement {
           <div class="d-flex align-items-center gap-2 flex-wrap">
             <span class="form-switch mb-0">
               <input data-id=${item.safe_id} data-name=${item.name}
-                data-virtual-control=${item.virtual_kind === 'music_dream_view' ? 'true' : 'false'}
+                data-virtual-control=${isDreamViewVirtual ? 'true' : 'false'}
                 class="form-check-input" type="checkbox" role="switch"
                 @click=${this._set_power_on} ?checked=${isOn}
                 .indeterminate=${!hasState}
@@ -420,16 +424,6 @@ export class DeviceList extends LitElement {
                   <option value=${mode} ?selected=${mode === activeMusicMode}>${mode}</option>
                 `)}
               </select>` : ''}
-            ${item.supports_dreamview ? html`
-              <label class="form-check form-switch d-flex align-items-center gap-1 mb-0 gv-dreamview-control"
-                     title="LAN-first hardware DreamView control">
-                <input class="form-check-input mt-0" type="checkbox" role="switch"
-                  data-id=${item.safe_id} data-name=${item.name}
-                  @click=${this._set_dreamview}
-                  ?checked=${item.dreamview_enabled === true}
-                  .indeterminate=${item.dreamview_enabled == null}>
-                <span class="small">DreamView</span>
-              </label>` : ''}
           </div>
         </td>
         <td class="text-end d-none d-md-table-cell">
@@ -454,7 +448,12 @@ export class DeviceList extends LitElement {
     }
 
     const physicalDevices = devices.filter((item) => !item.is_virtual);
-    const virtualControls = devices.filter((item) => item.is_virtual);
+    const virtualControls = devices
+      .filter((item) => item.is_virtual)
+      .sort((a, b) => {
+        const priority = this._virtualControlPriority(a) - this._virtualControlPriority(b);
+        return priority !== 0 ? priority : (a.name || '').localeCompare(b.name || '');
+      });
     const visibleDevices = this.hideUnavailable
       ? physicalDevices.filter((item) => item.available)
       : physicalDevices;
