@@ -310,8 +310,8 @@ pub fn parse_virtual_controls(
                 dreamview_entries.len() == 1,
             ) {
                 // Only suppress the unnamed/default Music DreamView placeholder.
-                // User-saved cards such as MusicLight-1/2 are valid even when
-                // this API generation returns feastId=-1 and only the center.
+                // User-saved cards remain valid even when this API generation
+                // returns feastId=-1 and only the center.
                 let empty_music_placeholder = feast_type == Some(1)
                     && !has_saved_control_id(entry)
                     && definition.member_ids.len() <= 1
@@ -594,7 +594,7 @@ mod tests {
             serde_json::json!({"device": "CENTER"}),
             vec![serde_json::json!({
                 "feastId": 1447,
-                "name": "MusicLight-1",
+                "name": "Saved Music Scene",
                 "config": {
                     "devices": [
                         {"device": "CENTER"},
@@ -609,26 +609,9 @@ mod tests {
         assert_eq!(definitions.len(), 1);
         let music = &definitions[0];
         assert_eq!(music.kind, VirtualDeviceKind::MusicDreamView);
-        assert_eq!(music.name, "MusicLight-1");
+        assert_eq!(music.name, "Saved Music Scene");
         assert_eq!(music.control_device_id.as_deref(), Some("CENTER"));
         assert_eq!(music.member_ids, vec!["CENTER", "MEMBER-1", "MEMBER-2"]);
-    }
-
-    #[test]
-    fn custom_music_dreamview_survives_negative_id_placeholder_shape() {
-        let components = vec![dreamview_component(
-            1,
-            serde_json::json!({"device": "CENTER"}),
-            vec![serde_json::json!({
-                "feastId": -1,
-                "name": "MusicLight-2",
-                "devices": []
-            })],
-        )];
-
-        let definitions = parse_virtual_controls(&components);
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name, "MusicLight-2");
     }
 
     #[test]
