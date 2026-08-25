@@ -1,4 +1,4 @@
-use crate::platform_api::DeviceType;
+use crate::platform_api::{DeviceParameters, DeviceType};
 use crate::service::coordinator::Coordinator;
 use crate::service::device::{Device, DeviceState};
 use crate::service::hass::topic_safe_string;
@@ -138,6 +138,24 @@ async fn resolve_device_read_only(state: &StateHandle, id: &str) -> Result<Devic
     state.resolve_device_read_only(&id).await.map_err(not_found)
 }
 
+fn observed_music_mode_name(device: &Device) -> Option<String> {
+    let value = device
+        .get_state_capability_by_instance("musicMode")?
+        .state
+        .pointer("/value/musicMode")?;
+    let field = device
+        .get_capability_by_instance("musicMode")?
+        .struct_field_by_name("musicMode")?;
+    let DeviceParameters::Enum { options } = &field.field_type else {
+        return None;
+    };
+
+    options
+        .iter()
+        .find(|option| option.value == *value)
+        .map(|option| option.name.clone())
+}
+
 /// Returns a json array of device information
 async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Response> {
     let mut devices = state.devices().await;
@@ -169,6 +187,8 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         pub supports_rgb: bool,
         pub supports_dreamview: bool,
         pub dreamview_enabled: Option<bool>,
+        pub supports_music_mode: bool,
+        pub active_music_mode: Option<String>,
     }
 
     let now = chrono::Utc::now();
@@ -188,6 +208,17 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         let cloud_online = d.cloud_online();
         let ip = d.ip_addr();
         let cloud_supported = d.http_device_info.is_some() || d.iot_api_supported();
+        let active_music_mode = d
+            .active_music_mode()
+            .map(|music| music.mode.clone())
+            .or_else(|| observed_music_mode_name(&d))
+            .or_else(|| {
+                device_state
+                    .as_ref()
+                    .and_then(|state| state.scene.as_deref())
+                    .and_then(|scene| scene.strip_prefix("Music: "))
+                    .map(str::to_string)
+            });
         // Govee exposes groups and similar virtual controls as type `Other`.
         // The API accepts control commands for them but rejects state polling.
         let cloud_status_observable = !is_virtual
@@ -222,6 +253,9 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
             supports_rgb: !is_virtual && d.supports_rgb(),
             supports_dreamview: !is_virtual && d.supports_dreamview(),
             dreamview_enabled: d.dreamview_enabled(),
+            supports_music_mode: !is_virtual
+                && d.get_capability_by_instance("musicMode").is_some(),
+            active_music_mode,
             safe_id: topic_safe_string(&d.id),
             sku: d.sku,
             id: d.id,
@@ -411,6 +445,32 @@ async fn device_list_scenes(
     let scenes = state.device_list_scenes(&device).await.map_err(generic)?;
 
     Ok(Json(scenes).into_response())
+}
+
+/// Returns the music modes exposed by the Platform API capability metadata.
+async fn device_list_music_modes(
+    State(state): State<StateHandle>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    let device = resolve_device_read_only(&state, &id).await?;
+    let modes = state
+        .device_list_music_modes(&device)
+        .await
+        .map_err(generic)?;
+    Ok(Json(modes).into_response())
+}
+
+/// Activates a music mode independently from the ordinary scene catalog.
+async fn device_set_music_mode(
+    State(state): State<StateHandle>,
+    Path((id, mode)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let device = resolve_device_for_control(&state, &id).await?;
+    state
+        .device_set_music_mode(&device, &mode)
+        .await
+        .map_err(generic)?;
+    Ok(response_with_code(StatusCode::OK, "ok"))
 }
 
 /// Returns available scenes with their original category and media metadata.
@@ -750,8 +810,16 @@ fn build_router(state: StateHandle, ingress_only: bool) -> Router {
         .route("/api/device/{id}/inspect", get(inspect_device))
         .route("/api/device/{id}/color/{color}", post(device_set_color))
         .route("/api/device/{id}/scene/{scene}", post(device_set_scene))
+        .route(
+            "/api/device/{id}/music-mode/{mode}",
+            post(device_set_music_mode),
+        )
         .route("/api/device/{id}/ptreal", post(device_send_ptreal))
         .route("/api/device/{id}/scenes", get(device_list_scenes))
+        .route(
+            "/api/device/{id}/music-modes",
+            get(device_list_music_modes),
+        )
         .route(
             "/api/device/{id}/scene-catalog",
             get(device_list_scenes_categorized),
@@ -1072,6 +1140,96 @@ mod tests {
         assert_eq!(item["cloud_online"], false);
         assert_eq!(item["available"], false);
         assert_eq!(item["supports_dreamview"], true);
+    }
+
+    #[tokio::test]
+    async fn music_modes_have_a_dedicated_web_api_contract() {
+        let state = StateHandle::default();
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "H6000".to_string(),
+                device: "AA:BB".to_string(),
+                device_name: "Music Lamp".to_string(),
+                device_type: crate::platform_api::DeviceType::Light,
+                capabilities: vec![crate::platform_api::DeviceCapability {
+                    kind: crate::platform_api::DeviceCapabilityKind::MusicSetting,
+                    instance: "musicMode".to_string(),
+                    parameters: Some(crate::platform_api::DeviceParameters::Struct {
+                        fields: vec![crate::platform_api::StructField {
+                            field_name: "musicMode".to_string(),
+                            field_type: crate::platform_api::DeviceParameters::Enum {
+                                options: vec![
+                                    crate::platform_api::EnumOption {
+                                        name: "Rhythm".to_string(),
+                                        value: serde_json::json!(1),
+                                        extras: Default::default(),
+                                    },
+                                    crate::platform_api::EnumOption {
+                                        name: "Spectrum".to_string(),
+                                        value: serde_json::json!(2),
+                                        extras: Default::default(),
+                                    },
+                                ],
+                            },
+                            default_value: None,
+                            required: true,
+                        }],
+                    }),
+                    alarm_type: None,
+                    event_state: None,
+                }],
+            });
+            device.set_http_device_state(crate::platform_api::HttpDeviceState {
+                sku: "H6000".to_string(),
+                device: "AA:BB".to_string(),
+                capabilities: vec![crate::platform_api::DeviceCapabilityState {
+                    kind: crate::platform_api::DeviceCapabilityKind::MusicSetting,
+                    instance: "musicMode".to_string(),
+                    state: serde_json::json!({
+                        "value": {
+                            "musicMode": 2,
+                            "sensitivity": 100,
+                            "autoColor": 1
+                        }
+                    }),
+                }],
+            });
+        }
+
+        let app = build_router(state, false);
+        let devices_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(devices_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["supports_music_mode"], true);
+        assert_eq!(json[0]["active_music_mode"], "Spectrum");
+
+        let modes_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/device/AABB/music-modes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(modes_response.status(), StatusCode::OK);
+        let body = to_bytes(modes_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let modes: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(modes, serde_json::json!(["Rhythm", "Spectrum"]));
     }
 
     #[tokio::test]

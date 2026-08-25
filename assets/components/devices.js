@@ -6,6 +6,7 @@ export class DeviceList extends LitElement {
   timer;
   deviceList;
   scenesCache = {};
+  musicModesCache = {};
   expandedDevice = null;
   inspectCache = {};
   hideUnavailable = true;
@@ -117,6 +118,19 @@ export class DeviceList extends LitElement {
     }
   }
 
+  _set_music_mode(e) {
+    e.stopPropagation();
+    const id = encodeURIComponent(e.target.dataset.id);
+    const name = e.target.dataset.name || id;
+    const mode = e.target.value;
+    if (mode) {
+      this._apiAction(
+        `api/device/${id}/music-mode/${encodeURIComponent(mode)}`,
+        `${name}: Music mode ${mode}`,
+      );
+    }
+  }
+
   async _loadScenes(device_id) {
     if (this.scenesCache[device_id]) return this.scenesCache[device_id];
     try {
@@ -125,6 +139,19 @@ export class DeviceList extends LitElement {
         this.scenesCache[device_id] = await resp.json();
         this.requestUpdate();
         return this.scenesCache[device_id];
+      }
+    } catch (err) { /* ignore */ }
+    return [];
+  }
+
+  async _loadMusicModes(device_id) {
+    if (this.musicModesCache[device_id]) return this.musicModesCache[device_id];
+    try {
+      const resp = await fetch(`api/device/${encodeURIComponent(device_id)}/music-modes`);
+      if (resp.ok) {
+        this.musicModesCache[device_id] = await resp.json();
+        this.requestUpdate();
+        return this.musicModesCache[device_id];
       }
     } catch (err) { /* ignore */ }
     return [];
@@ -297,9 +324,20 @@ export class DeviceList extends LitElement {
     const updated = hasState ? timeAgo(new Date(item.state.updated)) : '';
     const source = item.state?.source || '';
 
-    const scenes = item.is_virtual ? [] : (this.scenesCache[item.safe_id] || []);
+    const scenes = item.is_virtual
+      ? []
+      : (this.scenesCache[item.safe_id] || [])
+          .filter(scene => scene && !scene.toLowerCase().startsWith('music: '));
     if (!item.is_virtual && !this.scenesCache[item.safe_id]) this._loadScenes(item.safe_id);
     const active_scene = item.state?.scene || '';
+    const musicModes = item.supports_music_mode
+      ? (this.musicModesCache[item.safe_id] || [])
+      : [];
+    if (item.supports_music_mode && !this.musicModesCache[item.safe_id]) {
+      this._loadMusicModes(item.safe_id);
+    }
+    const activeMusicMode = item.active_music_mode
+      || (active_scene.startsWith('Music: ') ? active_scene.slice('Music: '.length) : '');
 
     const isExpanded = this.expandedDevice === item.safe_id;
 
@@ -355,6 +393,16 @@ export class DeviceList extends LitElement {
                 <option value="">Scene...</option>
                 ${scenes.filter(s => s).map(s => html`
                   <option value=${s} ?selected=${s === active_scene}>${s}</option>
+                `)}
+              </select>` : ''}
+            ${musicModes.length > 0 ? html`
+              <select class="form-select form-select-sm gv-scene-select gv-music-mode-select"
+                data-id=${item.safe_id} data-name=${item.name}
+                title="Platform API music mode"
+                @change=${this._set_music_mode} @click=${(e) => e.stopPropagation()}>
+                <option value="">Music mode...</option>
+                ${musicModes.filter(mode => mode).map(mode => html`
+                  <option value=${mode} ?selected=${mode === activeMusicMode}>${mode}</option>
                 `)}
               </select>` : ''}
             ${item.supports_dreamview ? html`

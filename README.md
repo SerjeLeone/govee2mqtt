@@ -31,7 +31,8 @@ via the [Home Assistant MQTT Integration](https://www.home-assistant.io/integrat
 * Device grouping — control multiple devices as one light entity.
 * Per-device configuration overrides via JSON file (names, color temp, icons, rooms).
 * Web UI with physical-device controls, separate group/DreamView-scene controls,
-  a dedicated hardware DreamView switch, live logs, and bridge status.
+  dedicated hardware DreamView and music-mode controls, live logs, and bridge
+  status.
 * Native Home Assistant fan entities, air-quality sensors, and diagnostic
   battery/Wi-Fi sensors for supported devices.
 * Bounded LAN retries and a per-device polling circuit breaker for congested or
@@ -158,6 +159,8 @@ Publish to these topics to control the bridge via MQTT:
 | `/api/device/{id}/scene/{name}` | POST | Activate scene |
 | `/api/device/{id}/scenes` | GET | List available scenes |
 | `/api/device/{id}/scene-catalog` | GET | Get categorized scenes, icons, and hints |
+| `/api/device/{id}/music-modes` | GET | List available music modes |
+| `/api/device/{id}/music-mode/{name}` | POST | Activate a music mode |
 | `/api/device/{id}/ptreal` | POST | Send raw ptReal commands |
 | `/api/config` | GET/PUT | Read or update device config |
 | `/api/oneclicks` | GET | List one-click scenes |

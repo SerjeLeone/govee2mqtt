@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn cloud_probe_observation_does_not_replace_lan_state() {
         let mut device = Device::new("H66A1", "aa:bb");
-        device.set_lan_device_status(LanDeviceStatus {
+        device.set_lan_device_status(DeviceStatus {
             on: true,
             brightness: 80,
             color: DeviceColor { r: 1, g: 2, b: 3 },
