@@ -110,6 +110,15 @@ configuration:
     description: >-
       Initial suspension period for an unresponsive device (default 300
       seconds, allowed range 30-900). It doubles after repeated failures.
+  lan_cloud_fallback:
+    name: Segment & DreamView Cloud Control
+    description: >-
+      Optional backup transport used only for RGBIC segment and hardware
+      DreamView commands after the LAN probes do not answer (about 2.45 seconds
+      with the defaults). Disabled means LAN only. IoT uses the signed-in Govee
+      account connection. Platform uses the official Govee API key. Normal
+      scene selection chooses LAN first and Platform automatically for devices
+      or scenes without a local path.
   disable_effects:
     name: Disable Effects
     description: >-

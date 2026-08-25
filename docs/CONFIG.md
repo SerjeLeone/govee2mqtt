@@ -120,6 +120,13 @@ client and the device metadata contains a usable IoT topic. This explicit
 selection overrides conservative automatic-routing defaults in device quirks;
 it does not alter transport selection for any other commands.
 
+Scene selection does not use this fallback option. Scenes dynamically prefer a
+verified LAN path when the device was discovered locally. Devices without LAN,
+and individual scenes that have no local encoding, use the Platform API when
+the requested scene is advertised in that device's Platform capabilities.
+Decoded IoT scene packets remain the final path when Platform cannot provide
+the requested scene.
+
 Independent segment brightness has no verified LAN `ptReal` packet. A
 brightness-only segment command therefore needs the `platform` fallback;
 segment color and off remain local. Camera-based video sync that is not exposed

@@ -1,3 +1,4 @@
+use crate::platform_api::DeviceType;
 use crate::service::coordinator::Coordinator;
 use crate::service::device::{Device, DeviceState};
 use crate::service::hass::topic_safe_string;
@@ -154,15 +155,28 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
         pub mqtt_configured: bool,
         pub api_metadata: bool,
         pub lan_discovered: bool,
+        pub available: bool,
+        pub cloud_supported: bool,
+        pub cloud_status_observable: bool,
         pub cloud_online: Option<bool>,
     }
 
+    let now = chrono::Utc::now();
     let devices: Vec<_> = devices
         .into_iter()
         .map(|d| {
             let device_state = d.device_state();
-            let cloud_online = device_state.as_ref().and_then(|value| value.online);
+            let cloud_online = d.cloud_online();
             let ip = d.ip_addr();
+            let cloud_supported = d.http_device_info.is_some() || d.iot_api_supported();
+            // Govee exposes groups and similar virtual controls as type
+            // `Other`. The API accepts control commands for them but rejects
+            // state polling, so an online/offline state cannot be queried.
+            let cloud_status_observable = !matches!(d.device_type(), DeviceType::Other(_));
+            let available = d.is_online(now)
+                || (cloud_supported
+                    && !cloud_status_observable
+                    && cloud_online != Some(false));
             DeviceItem {
                 name: d.name(),
                 room: d.room_name().map(|r| r.to_string()),
@@ -171,6 +185,9 @@ async fn list_devices(State(state): State<StateHandle>) -> Result<Response, Resp
                 mqtt_configured,
                 api_metadata: d.http_device_info.is_some(),
                 lan_discovered: ip.is_some(),
+                available,
+                cloud_supported,
+                cloud_status_observable,
                 cloud_online,
                 safe_id: topic_safe_string(&d.id),
                 sku: d.sku,
@@ -926,6 +943,75 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn devices_endpoint_reports_independent_cloud_and_availability_status() {
+        let state = StateHandle::default();
+        {
+            let mut device = state.device_mut("H6000", "AA:BB").await;
+            device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "H6000".to_string(),
+                device: "AA:BB".to_string(),
+                device_name: "Cloud Lamp".to_string(),
+                device_type: crate::platform_api::DeviceType::Light,
+                capabilities: vec![],
+            });
+            device.set_cloud_online(false);
+        }
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let item = &json[0];
+        assert_eq!(item["cloud_supported"], true);
+        assert_eq!(item["cloud_status_observable"], true);
+        assert_eq!(item["cloud_online"], false);
+        assert_eq!(item["available"], false);
+    }
+
+    #[tokio::test]
+    async fn devices_endpoint_keeps_unpollable_cloud_controls_visible() {
+        let state = StateHandle::default();
+        {
+            let mut device = state.device_mut("BaseGroup", "1234").await;
+            device.set_http_device_info(crate::platform_api::HttpDeviceInfo {
+                sku: "BaseGroup".to_string(),
+                device: "1234".to_string(),
+                device_name: "Living Room".to_string(),
+                device_type: crate::platform_api::DeviceType::Other("NONE".to_string()),
+                capabilities: vec![],
+            });
+        }
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let item = &json[0];
+        assert_eq!(item["cloud_supported"], true);
+        assert_eq!(item["cloud_status_observable"], false);
+        assert_eq!(item["cloud_online"], serde_json::Value::Null);
+        assert_eq!(item["available"], true);
     }
 
     #[tokio::test]

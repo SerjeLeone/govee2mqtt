@@ -8,13 +8,20 @@ export class DeviceList extends LitElement {
   scenesCache = {};
   expandedDevice = null;
   inspectCache = {};
+  hideUnavailable = true;
 
   static properties = {
     expandedDevice: { type: String },
+    hideUnavailable: { type: Boolean },
   };
 
   constructor() {
     super();
+    try {
+      this.hideUnavailable = localStorage.getItem('gv-hide-unavailable-devices') !== 'false';
+    } catch (_) {
+      this.hideUnavailable = true;
+    }
   }
 
   _deviceListTask = new Task(this, {
@@ -204,6 +211,29 @@ export class DeviceList extends LitElement {
     return html`<span class="badge rounded-pill ${active ? activeClass : 'text-bg-secondary'}">${label}</span>`;
   }
 
+  _render_cloud_badge(item) {
+    if (!item.cloud_supported) {
+      return html`<span class="badge rounded-pill text-bg-secondary">Cloud: unavailable</span>`;
+    }
+    if (item.cloud_online === true) {
+      return html`<span class="badge rounded-pill text-bg-success">Cloud: online</span>`;
+    }
+    if (item.cloud_online === false) {
+      return html`<span class="badge rounded-pill text-bg-danger">Cloud: offline</span>`;
+    }
+    if (!item.cloud_status_observable) {
+      return html`<span class="badge rounded-pill text-bg-info">Cloud: control only</span>`;
+    }
+    return html`<span class="badge rounded-pill text-bg-secondary">Cloud: checking…</span>`;
+  }
+
+  _toggleUnavailableFilter(e) {
+    this.hideUnavailable = e.target.checked;
+    try {
+      localStorage.setItem('gv-hide-unavailable-devices', String(this.hideUnavailable));
+    } catch (_) { /* persistence is optional */ }
+  }
+
   _status_summary(devices) {
     const mqttConfigured = devices.some((item) => item.mqtt_configured);
     const apiCount = devices.filter((item) => item.api_metadata).length;
@@ -213,6 +243,13 @@ export class DeviceList extends LitElement {
         ${this._render_badge('MQTT configured', mqttConfigured)}
         <span class="badge rounded-pill text-bg-info">API metadata: ${apiCount}</span>
         <span class="badge rounded-pill text-bg-info">LAN discovered: ${lanCount}</span>
+        <label class="form-check form-switch device-availability-filter mb-0"
+               title="Hide devices that have not answered through LAN or cloud">
+          <input class="form-check-input" type="checkbox" role="switch"
+                 .checked=${this.hideUnavailable}
+                 @change=${this._toggleUnavailableFilter}>
+          <span class="form-check-label">Hide unavailable</span>
+        </label>
       </div>`;
   }
 
@@ -247,21 +284,13 @@ export class DeviceList extends LitElement {
       <tr class="gv-device-row ${isExpanded ? 'table-active' : ''}"
           data-id=${item.safe_id} @click=${this._toggleDetail}>
         <td>
-          <span class="gv-status-dot ${hasState ? 'online' : 'offline'}"></span>
+          <span class="gv-status-dot ${item.available ? 'online' : 'offline'}"></span>
           <strong>${item.name}</strong>
           ${item.room ? html`<br><small class="text-muted">${item.room}</small>` : ''}
           <div class="d-flex flex-wrap gap-1 mt-1">
             ${this._render_badge('API', item.api_metadata)}
             ${this._render_badge('LAN', item.lan_discovered)}
-            ${this._render_badge(
-              item.cloud_online == null
-                ? 'Cloud'
-                : item.cloud_online
-                  ? 'Cloud online'
-                  : 'Cloud offline',
-              item.cloud_online,
-              'text-bg-success'
-            )}
+            ${this._render_cloud_badge(item)}
           </div>
         </td>
         <td class="gv-device-controls" @click=${(e) => e.stopPropagation()}>
@@ -310,9 +339,19 @@ export class DeviceList extends LitElement {
         </div>`;
     }
 
+    const visibleDevices = this.hideUnavailable
+      ? devices.filter((item) => item.available)
+      : devices;
+
     return html`
       ${this._status_summary(devices)}
-      ${this._room_groups(devices).map(([room, items]) => html`
+      ${visibleDevices.length === 0
+        ? html`<div class="alert alert-secondary">
+            All unavailable devices are hidden. Turn off <strong>Hide unavailable</strong>
+            to inspect them.
+          </div>`
+        : ''}
+      ${this._room_groups(visibleDevices).map(([room, items]) => html`
         <section class="device-room-section mb-4">
           <h2>${room}</h2>
           <div class="gv-table-wrap">
@@ -330,7 +369,12 @@ export class DeviceList extends LitElement {
             </table>
           </div>
         </section>`)}
-      <small class="text-muted">${devices.length} device${devices.length !== 1 ? 's' : ''}. Click a row for details.</small>`;
+      <small class="text-muted">
+        ${visibleDevices.length === devices.length
+          ? `${devices.length} device${devices.length !== 1 ? 's' : ''}`
+          : `${visibleDevices.length} of ${devices.length} devices shown`}.
+        Click a row for details.
+      </small>`;
   }
 }
 

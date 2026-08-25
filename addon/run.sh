@@ -5,8 +5,14 @@ export RUST_LOG_STYLE=always
 export XDG_CACHE_HOME=/data
 # export GOVEE_HTTP_INGRESS_ONLY=1
 
-# Propagate timezone from Home Assistant
-export TZ="$(bashio::supervisor.timezone)"
+# Home Assistant Supervisor injects its system timezone into every add-on as TZ.
+# Keep that value intact: querying Supervisor here requires hassio_api access and,
+# when access is denied, would replace a valid TZ with an empty value (UTC logs).
+if [[ -n "${TZ:-}" ]]; then
+  bashio::log.info "Using Home Assistant system timezone: ${TZ}"
+else
+  bashio::log.warning "Home Assistant did not provide TZ; using the container system timezone"
+fi
 
 # Generic config-to-env helper
 export_config() {

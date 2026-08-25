@@ -143,7 +143,9 @@ async fn run_push_loop(
                 if let Err(err) = client.subscribe(&topic, QoS::AtLeastOnce).await {
                     log::error!("Failed to subscribe to Govee push topic: {err:#}");
                 } else {
-                    log::info!("Subscribed to Govee push topic: {topic}");
+                    // The topic contains the Platform API key. Never emit it
+                    // into add-on logs or diagnostics bundles.
+                    log::info!("Subscribed to Govee push topic");
                 }
             }
             Event::Disconnected(reason) => {
@@ -244,6 +246,13 @@ async fn process_push_event(state: &StateHandle, event: &GoveeEvent) {
             }
         }
     }
+
+    // Receiving a device-scoped event is direct evidence that the cloud path
+    // for this device is alive, even when the event carries no state fields.
+    state
+        .device_mut(sku, device_id)
+        .await
+        .set_cloud_online(true);
 
     // Update capability states on the device
     if !event.capabilities.is_empty() {

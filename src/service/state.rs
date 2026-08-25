@@ -105,6 +105,28 @@ fn feature_transport_order(
     order
 }
 
+/// Scene routing is dynamic rather than controlled by the segment/DreamView
+/// fallback option. Local control wins when the device was discovered on LAN;
+/// Platform is the normal scene transport for cloud-only devices and for
+/// scenes without a local encoding; decoded IoT packets are the last resort.
+fn scene_transport_order(
+    has_lan_device: bool,
+    has_platform_scene_path: bool,
+    has_iot_scene_path: bool,
+) -> Vec<FeatureTransport> {
+    let mut order = vec![];
+    if has_lan_device {
+        order.push(FeatureTransport::Lan);
+    }
+    if has_platform_scene_path {
+        order.push(FeatureTransport::Platform);
+    }
+    if has_iot_scene_path {
+        order.push(FeatureTransport::Iot);
+    }
+    order
+}
+
 impl State {
     pub fn new() -> Self {
         Self::default()
@@ -260,6 +282,34 @@ impl State {
         self.platform_client.lock().await.clone()
     }
 
+    /// Keep per-device cloud reachability independent from the most recent
+    /// combined state source. A successful Platform command proves that the
+    /// cloud path is usable; Govee's explicit "device is offline" response is
+    /// the corresponding negative observation. Other transport/server errors
+    /// leave the last known status unchanged.
+    async fn observe_platform_result<T>(
+        &self,
+        device: &Device,
+        result: anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let cloud_online = match &result {
+            Ok(_) => Some(true),
+            Err(err) => HttpRequestFailed::from_err(err).and_then(|http_err| {
+                (http_err.content_contains("Device is offline")
+                    || http_err.content_contains("device is offline"))
+                .then_some(false)
+            }),
+        };
+
+        if let Some(online) = cloud_online {
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_cloud_online(online);
+        }
+
+        result
+    }
+
     pub async fn set_undoc_client(&self, client: GoveeUndocumentedApi) {
         self.undoc_client.lock().await.replace(client);
     }
@@ -375,6 +425,20 @@ impl State {
                         return Ok(true);
                     }
                     Err(err) => {
+                        // Preserve an explicit cloud-offline answer for the
+                        // Web UI even when the state poll itself failed.
+                        // Transient HTTP/TLS failures are deliberately left
+                        // as "last known" rather than mislabeling the device.
+                        if let Some(http_err) = HttpRequestFailed::from_err(&err) {
+                            if http_err.content_contains("Device is offline")
+                                || http_err.content_contains("device is offline")
+                            {
+                                self.device_mut(&device.sku, &device.id)
+                                    .await
+                                    .set_cloud_online(false);
+                            }
+                        }
+
                         // Govee returns HTTP 200 with embedded status 400 and
                         // msg "devices not belong you" for devices no longer
                         // associated with the account (or BLE-only devices).
@@ -487,14 +551,14 @@ impl State {
 
         log::info!("Using configured Platform fallback for {device} segment {segment}");
         if let Some(brightness) = brightness {
-            client
-                .set_segment_brightness(info, segment, brightness)
-                .await?;
+            let result = client.set_segment_brightness(info, segment, brightness).await;
+            self.observe_platform_result(device, result).await?;
         }
         if let Some(color) = color {
-            client
+            let result = client
                 .set_segment_rgb(info, segment, color.r, color.g, color.b)
-                .await?;
+                .await;
+            self.observe_platform_result(device, result).await?;
         }
         Ok(())
     }
@@ -513,9 +577,10 @@ impl State {
             .ok_or_else(|| anyhow::anyhow!("Platform metadata is missing for {device}"))?;
 
         log::info!("Using configured Platform fallback to set DreamView for {device}");
-        client
+        let result = client
             .set_toggle_state(info, "dreamViewToggle", enabled)
-            .await?;
+            .await;
+        self.observe_platform_result(device, result).await?;
         Ok(())
     }
 
@@ -708,7 +773,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to send {value:?} control to {device}");
-                client.control_device(info, capability, value).await?;
+                let result = client.control_device(info, capability, value).await;
+                self.observe_platform_result(device, result).await?;
                 return Ok(());
             }
         }
@@ -763,7 +829,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} light {instance_name} state");
-                client.set_toggle_state(info, instance_name, on).await?;
+                let result = client.set_toggle_state(info, instance_name, on).await;
+                self.observe_platform_result(device, result).await?;
                 if !on {
                     self.device_mut(&device.sku, &device.id)
                         .await
@@ -807,7 +874,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} power state");
-                client.set_power_state(info, on).await?;
+                let result = client.set_power_state(info, on).await;
+                self.observe_platform_result(device, result).await?;
                 if !on {
                     self.device_mut(&device.sku, &device.id)
                         .await
@@ -852,7 +920,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} brightness");
-                client.set_brightness(info, percent).await?;
+                let result = client.set_brightness(info, percent).await;
+                self.observe_platform_result(device, result).await?;
                 return Ok(());
             }
         }
@@ -887,7 +956,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} color temperature");
-                client.set_color_temperature(info, kelvin).await?;
+                let result = client.set_color_temperature(info, kelvin).await;
+                self.observe_platform_result(device, result).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .set_active_scene(None);
@@ -943,7 +1013,8 @@ impl State {
 
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
-                client.set_work_mode(info, work_mode, value).await?;
+                let result = client.set_work_mode(info, work_mode, value).await;
+                self.observe_platform_result(device, result).await?;
                 return Ok(());
             }
         }
@@ -993,7 +1064,8 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} color");
-                client.set_color_rgb(info, r, g, b).await?;
+                let result = client.set_color_rgb(info, r, g, b).await;
+                self.observe_platform_result(device, result).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .set_active_scene(None);
@@ -1207,9 +1279,10 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} target temperature to {target}");
-                client
+                let result = client
                     .set_target_temperature(info, instance_name, target)
-                    .await?;
+                    .await;
+                self.observe_platform_result(device, result).await?;
                 return Ok(());
             }
         }
@@ -1222,66 +1295,137 @@ impl State {
         device: &Device,
         scene: &str,
     ) -> anyhow::Result<()> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
         let avoid_platform_api = device.avoid_platform_api();
+        let decoded_commands =
+            crate::service::scene_database::scene_commands(&device.sku, scene);
+        let platform_path = if avoid_platform_api {
+            None
+        } else {
+            self.get_platform_client().await.and_then(|client| {
+                device
+                    .http_device_info
+                    .as_ref()
+                    .map(|info| (client, info))
+            })
+        };
+        let iot_path = if decoded_commands.is_some() {
+            self.iot_for_device(device).await
+        } else {
+            None
+        };
+        let order = scene_transport_order(
+            device.lan_device.is_some(),
+            platform_path.is_some(),
+            iot_path.is_some(),
+        );
 
-        if !avoid_platform_api {
-            if let Some(client) = self.get_platform_client().await {
-                if let Some(info) = &device.http_device_info {
-                    log::info!("Using Platform API to set {device} to scene {scene}");
-                    client.set_scene_by_name(info, scene).await?;
-                    let mut device = self.device_mut(&device.sku, &device.id).await;
-                    if let Some(mode) = scene.strip_prefix("Music: ") {
-                        device.set_active_music_mode(mode, 100, true);
-                    } else {
-                        device.set_active_scene(Some(scene));
-                    }
-                    return Ok(());
-                }
-            }
+        if order.is_empty() {
+            anyhow::bail!(
+                "Unable to set scene {scene} for {device}: no LAN, Platform, or IoT scene path is available"
+            );
         }
 
-        if let Some(lan_dev) = &device.lan_device {
-            // Try undocumented scene catalog first
-            if let Ok(()) = lan_dev.set_scene_by_name(scene).await {
-                log::info!("Using LAN API (undoc catalog) to set {device} to scene {scene}");
-                self.device_mut(&device.sku, &device.id)
-                    .await
-                    .set_active_scene(Some(scene));
-                return Ok(());
-            }
-
-            // Fall back to decoded scene database (AlgoClaw ptReal commands)
-            if let Some(commands) =
-                crate::service::scene_database::scene_commands(&device.sku, scene)
-            {
-                log::info!(
-                    "Using LAN API (decoded database) to set {device} to scene {scene} ({} commands)",
-                    commands.len()
-                );
-                lan_dev.send_real(commands).await?;
-                self.device_mut(&device.sku, &device.id)
-                    .await
-                    .set_active_scene(Some(scene));
-                return Ok(());
-            }
-        }
-
-        // Also try decoded database via IoT if no LAN
-        if let Some(commands) = crate::service::scene_database::scene_commands(&device.sku, scene) {
-            if let Some(iot) = self.get_iot_client().await {
-                if let Some(info) = &device.undoc_device_info {
-                    log::info!("Using IoT API (decoded database) to set {device} to scene {scene}");
-                    iot.send_real(&info.entry, commands).await?;
-                    self.device_mut(&device.sku, &device.id)
+        let mut failures = vec![];
+        for transport in order {
+            let result = match transport {
+                FeatureTransport::Lan => {
+                    if let Some(commands) = decoded_commands.clone() {
+                        self.send_lan_feature_command(
+                            device,
+                            &format!("scene {scene}"),
+                            commands,
+                        )
                         .await
-                        .set_active_scene(Some(scene));
+                    } else {
+                        let lan_device = device
+                            .lan_device
+                            .as_ref()
+                            .expect("scene transport order requires a LAN device");
+                        log::debug!(
+                            "Trying LAN API (undocumented catalog) for {device} scene {scene}"
+                        );
+                        match lan_device.set_scene_by_name(scene).await {
+                            Ok(()) => async {
+                                let client = self.get_lan_client().await.ok_or_else(|| {
+                                    anyhow::anyhow!("LAN client is not running")
+                                })?;
+                                let status = client.query_status(lan_device).await.with_context(
+                                    || {
+                                        format!(
+                                            "{device} did not answer LAN status probes after scene {scene}"
+                                        )
+                                    },
+                                )?;
+                                self.device_mut(&device.sku, &device.id)
+                                    .await
+                                    .set_lan_device_status(status);
+                                log::info!(
+                                    "Using LAN API (undocumented catalog) to set {device} to scene {scene}"
+                                );
+                                Ok::<(), anyhow::Error>(())
+                            }
+                            .await,
+                            Err(err) => Err(err),
+                        }
+                    }
+                }
+                FeatureTransport::Platform => {
+                    let (client, info) = platform_path
+                        .as_ref()
+                        .expect("scene transport order requires a Platform path");
+                    if device.lan_device.is_some() {
+                        log::info!(
+                            "Using Platform API to set {device} to scene {scene} after the local path was unavailable"
+                        );
+                    } else {
+                        log::info!(
+                            "Using Platform API to set {device} to scene {scene} (device not discovered on LAN)"
+                        );
+                    }
+                    let result = client.set_scene_by_name(info, scene).await;
+                    self.observe_platform_result(device, result)
+                        .await
+                        .map(|_| ())
+                }
+                FeatureTransport::Iot => {
+                    let (iot, entry) = iot_path
+                        .as_ref()
+                        .expect("scene transport order requires an IoT path");
+                    let commands = decoded_commands
+                        .clone()
+                        .expect("IoT scene path requires decoded commands");
+                    log::info!(
+                        "Using IoT API (decoded database) to set {device} to scene {scene}"
+                    );
+                    iot.send_real(entry, commands).await
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    let mut stored = self.device_mut(&device.sku, &device.id).await;
+                    if let Some(mode) = scene.strip_prefix("Music: ") {
+                        stored.set_active_music_mode(mode, 100, true);
+                    } else {
+                        stored.set_active_scene(Some(scene));
+                    }
+                    drop(stored);
+                    self.notify_of_state_change(&device.id).await?;
                     return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "{transport:?} scene control failed for {device} scene {scene}: {err:#}"
+                    );
+                    failures.push(format!("{transport:?}: {err:#}"));
                 }
             }
         }
 
-        anyhow::bail!("Unable to set scene for {device}");
+        anyhow::bail!(
+            "Unable to set scene {scene} for {device}: {}",
+            failures.join("; ")
+        );
     }
 
     pub async fn device_set_capability_option(
@@ -1290,32 +1434,29 @@ impl State {
         instance: &str,
         option: &str,
     ) -> anyhow::Result<()> {
+        if matches!(instance, "lightScene" | "diyScene") {
+            self.device_set_scene(device, option).await?;
+            self.device_mut(&device.sku, &device.id)
+                .await
+                .set_active_scene_for_instance(Some(instance), Some(option));
+            return Ok(());
+        }
+
         let avoid_platform_api = device.avoid_platform_api();
 
         if !avoid_platform_api {
             if let Some(client) = self.get_platform_client().await {
                 if let Some(info) = &device.http_device_info {
                     log::info!("Using Platform API to set {device} {instance} to {option}");
-                    client
+                    let result = client
                         .set_capability_by_name(info, instance, option)
-                        .await?;
+                        .await;
+                    self.observe_platform_result(device, result).await?;
                     self.device_mut(&device.sku, &device.id)
                         .await
                         .set_active_scene_for_instance(Some(instance), Some(option));
                     return Ok(());
                 }
-            }
-        }
-
-        // LAN fallback for scene-type capabilities
-        if instance == "lightScene" {
-            if let Some(lan_dev) = &device.lan_device {
-                log::info!("Using LAN API to set {device} {instance} to {option}");
-                lan_dev.set_scene_by_name(option).await?;
-                self.device_mut(&device.sku, &device.id)
-                    .await
-                    .set_active_scene_for_instance(Some(instance), Some(option));
-                return Ok(());
             }
         }
 
@@ -1335,9 +1476,10 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} music mode to {mode}");
-                client
+                let result = client
                     .set_music_mode(info, mode, sensitivity, auto_color)
-                    .await?;
+                    .await;
+                self.observe_platform_result(device, result).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .set_active_music_mode(mode, sensitivity, auto_color);
@@ -1372,9 +1514,10 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} music sensitivity to {sensitivity}");
-                client
+                let result = client
                     .set_music_mode(info, &music.mode, sensitivity, music.auto_color)
-                    .await?;
+                    .await;
+                self.observe_platform_result(device, result).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .update_active_music_mode(Some(sensitivity), None)?;
@@ -1409,9 +1552,10 @@ impl State {
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
                 log::info!("Using Platform API to set {device} music autoColor to {auto_color}");
-                client
+                let result = client
                     .set_music_mode(info, &music.mode, music.sensitivity, auto_color)
-                    .await?;
+                    .await;
+                self.observe_platform_result(device, result).await?;
                 self.device_mut(&device.sku, &device.id)
                     .await
                     .update_active_music_mode(None, Some(auto_color))?;
@@ -1630,8 +1774,8 @@ fn enum_capability_names_from_device_info(device: &Device, instance: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        feature_transport_order, merge_scene_catalog_sources, sort_and_dedup_scenes,
-        FeatureTransport, State,
+        feature_transport_order, merge_scene_catalog_sources, scene_transport_order,
+        sort_and_dedup_scenes, FeatureTransport, State,
     };
     use crate::lan_api::{CloudFallbackTransport, LanDevice};
     use crate::platform_api::HttpDeviceInfo;
@@ -1661,6 +1805,30 @@ mod tests {
         assert_eq!(
             feature_transport_order(false, CloudFallbackTransport::Platform),
             vec![FeatureTransport::Platform]
+        );
+    }
+
+    #[test]
+    fn scene_transport_order_is_dynamic_and_lan_first() {
+        assert_eq!(
+            scene_transport_order(true, true, true),
+            vec![
+                FeatureTransport::Lan,
+                FeatureTransport::Platform,
+                FeatureTransport::Iot,
+            ]
+        );
+        assert_eq!(
+            scene_transport_order(false, true, true),
+            vec![FeatureTransport::Platform, FeatureTransport::Iot]
+        );
+        assert_eq!(
+            scene_transport_order(false, true, false),
+            vec![FeatureTransport::Platform]
+        );
+        assert_eq!(
+            scene_transport_order(false, false, false),
+            Vec::<FeatureTransport>::new()
         );
     }
 

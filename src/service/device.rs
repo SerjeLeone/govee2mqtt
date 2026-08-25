@@ -37,6 +37,12 @@ pub struct Device {
     pub iot_device_status: Option<LanDeviceStatus>,
     pub last_iot_device_status_update: Option<DateTime<Utc>>,
 
+    /// Latest explicit observation of this device's connectivity through a
+    /// Govee cloud transport. Kept separately from `DeviceState`: a newer LAN
+    /// state must not erase a valid cloud status in the Web UI.
+    cloud_online: Option<bool>,
+    last_cloud_status_update: Option<DateTime<Utc>>,
+
     /// When an IoT packet last carried an explicit `state.mode`.
     /// `last_iot_device_status_update` is re-stamped by every IoT packet,
     /// including mode-less ones whose merge carries the cached mode
@@ -210,16 +216,49 @@ impl Device {
         }
     }
 
-    /// Returns whether this device has been heard from recently enough
-    /// to consider it online. Used by availability, health, and HTTP endpoints.
+    /// Returns whether this device is currently reachable through at least one
+    /// transport. Sending an IoT status request is deliberately not enough:
+    /// `last_polled` is a throttle timestamp and does not prove that an offline
+    /// device answered.
     pub fn is_online(&self, now: DateTime<Utc>) -> bool {
         let stale_threshold = self.preferred_poll_interval() * 3;
-        self.last_polled
-            .or(self.last_lan_device_status_update)
-            .or(self.last_iot_device_status_update)
-            .or(self.last_http_device_state_update)
+
+        if self
+            .last_lan_device_status_update
             .map(|last_seen| now - last_seen < stale_threshold)
             .unwrap_or(false)
+        {
+            return true;
+        }
+
+        // An explicit cloud-offline result is authoritative until a later IoT,
+        // Platform-state or cloud-control success calls `set_cloud_online(true)`.
+        match self.cloud_online {
+            Some(false) => false,
+            Some(true) => self
+                .last_cloud_status_update
+                // The account device list refreshes roughly every ten minutes,
+                // so use a wider window than the normal two-minute state poll.
+                .map(|last_seen| now - last_seen < chrono::Duration::minutes(30))
+                .unwrap_or(false),
+            None => self
+                .last_iot_device_status_update
+                .or(self.last_http_device_state_update)
+                .map(|last_seen| now - last_seen < stale_threshold)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Record a positive or negative cloud-connectivity observation.
+    pub fn set_cloud_online(&mut self, online: bool) {
+        self.cloud_online = Some(online);
+        self.last_cloud_status_update = Some(Utc::now());
+    }
+
+    /// Latest cloud status, independent of whichever transport supplied the
+    /// most recent combined device state.
+    pub fn cloud_online(&self) -> Option<bool> {
+        self.cloud_online
     }
 
     pub fn ip_addr(&self) -> Option<IpAddr> {
@@ -305,6 +344,7 @@ impl Device {
     pub fn set_iot_device_status(&mut self, status: LanDeviceStatus) {
         self.iot_device_status.replace(status);
         self.last_iot_device_status_update.replace(Utc::now());
+        self.set_cloud_online(true);
         self.clear_scene_if_light_powered_off(self.compute_iot_device_state());
     }
 
@@ -314,6 +354,12 @@ impl Device {
     }
 
     pub fn set_http_device_state(&mut self, state: HttpDeviceState) {
+        let cloud_online = state
+            .capability_by_instance("online")
+            .and_then(|cap| cap.state.pointer("/value").and_then(|value| value.as_bool()))
+            // A successful Platform state response is itself a positive cloud
+            // observation when this SKU omits the optional online capability.
+            .unwrap_or(true);
         if let Some(enabled) = state
             .capability_by_instance("dreamViewToggle")
             .and_then(|cap| cap.state.pointer("/value").and_then(|value| value.as_i64()))
@@ -323,6 +369,7 @@ impl Device {
         }
         self.http_device_state.replace(state);
         self.last_http_device_state_update.replace(Utc::now());
+        self.set_cloud_online(cloud_online);
         self.clear_scene_if_light_powered_off(self.compute_http_device_state());
     }
 
@@ -331,11 +378,15 @@ impl Device {
         entry: crate::undoc_api::DeviceEntry,
         room_name: Option<&str>,
     ) {
+        let cloud_online = entry.device_ext.last_device_data.online;
         self.undoc_device_info.replace(UndocDeviceInfo {
             entry,
             room_name: room_name.map(|s| s.to_string()),
         });
         self.last_undoc_device_info_update.replace(Utc::now());
+        if let Some(online) = cloud_online {
+            self.set_cloud_online(online);
+        }
     }
 
     pub fn compute_iot_device_state(&self) -> Option<DeviceState> {
@@ -941,10 +992,10 @@ mod test {
     }
 
     #[test]
-    fn is_online_true_when_recently_polled() {
+    fn is_online_false_when_only_a_poll_request_was_sent() {
         let mut device = Device::new("H6000", "aa:bb");
         device.last_polled = Some(Utc::now());
-        assert!(device.is_online(Utc::now()));
+        assert!(!device.is_online(Utc::now()));
     }
 
     #[test]
@@ -965,6 +1016,28 @@ mod test {
     fn is_online_true_from_http_update() {
         let mut device = Device::new("H6000", "aa:bb");
         device.last_http_device_state_update = Some(Utc::now());
+        assert!(device.is_online(Utc::now()));
+    }
+
+    #[test]
+    fn explicit_cloud_status_controls_cloud_only_availability() {
+        let mut device = Device::new("H6000", "aa:bb");
+
+        device.set_cloud_online(true);
+        assert_eq!(device.cloud_online(), Some(true));
+        assert!(device.is_online(Utc::now()));
+
+        device.set_cloud_online(false);
+        assert_eq!(device.cloud_online(), Some(false));
+        assert!(!device.is_online(Utc::now()));
+    }
+
+    #[test]
+    fn recent_lan_response_remains_available_when_cloud_is_offline() {
+        let mut device = Device::new("H6000", "aa:bb");
+        device.last_lan_device_status_update = Some(Utc::now());
+        device.set_cloud_online(false);
+
         assert!(device.is_online(Utc::now()));
     }
 
@@ -1003,6 +1076,20 @@ mod test {
             entry,
         });
         assert!(device.iot_api_supported());
+    }
+
+    #[test]
+    fn undocumented_account_status_populates_cloud_status() {
+        let resp: crate::undoc_api::DevicesResponse =
+            crate::platform_api::from_json(include_str!("../../test-data/undoc-device-list.json"))
+                .unwrap();
+        let entry = resp.devices.into_iter().next().unwrap();
+        let expected = entry.device_ext.last_device_data.online;
+        let mut device = Device::new(&entry.sku, &entry.device);
+
+        device.set_undoc_device_info(entry, None);
+
+        assert_eq!(device.cloud_online(), expected);
     }
 
     #[test]
